@@ -136,9 +136,18 @@ _TARGET_NOFILE = 1048576
 # poison the status even with the probe fixed.
 #
 # Inlined into ibm-ray.yml.j2 as `ray_prlimit_command`.
+#
+# Match the raylet by its exact process name (comm), not `pgrep -f
+# raylet/raylet`: the -f pattern matched the cmdline of any process whose
+# argv embeds this command string itself -- on Kubernetes that is PID 1 (the
+# pod command contains the rendered template) and the STEP subshells, so the
+# head made 5 pids x 2 failing `sudo prlimit` calls per start (PID 1 is not
+# tunable by a non-root user). An exact comm match can never self-match. If
+# pgrep is absent (no procps on minimal images) or lacks -x, the `command -v`
+# chain short-circuits and this whole block stays a no-op.
 RAY_PRLIMIT = (
     'command -v prlimit >/dev/null 2>&1 && '
-    'for id in $(pgrep -f raylet/raylet); do '
+    'for id in $(pgrep -x raylet); do '
     'hard=$(awk \'/Max open files/ {print $5}\' /proc/$id/limits); '
     f'sudo prlimit --nofile={_TARGET_NOFILE}:{_TARGET_NOFILE} --pid=$id '
     '2>/dev/null || sudo prlimit --nofile="$hard:" --pid=$id || '
@@ -178,6 +187,19 @@ _SOURCE_LEGACY_HOST_NETWORK_PORTS = (
     'fi; ')
 
 _RAY_PATCHES_TARGET_DIR = '/tmp/sky_ray_patches'
+
+# `ray stop` before `ray start`, but only when a previous Ray session could
+# still be alive: Ray always creates its temp dir (passed as --temp-dir) at
+# startup, so a missing dir means no SkyPilot Ray was ever started here --
+# the common case for fresh Kubernetes pods and fresh VMs, where `ray stop`
+# is a guaranteed no-op that still costs the Ray CLI import plus its process
+# scan (measured 4.0 s on a fresh K8s head pod, ~1.5-2 s on workers). A stale
+# session (rebooted VM, retried start) always has the dir and is still
+# stopped first. Exit status semantics match the previous bare `ray stop;`:
+# when the dir exists, `ray stop`'s status propagates; when it does not, the
+# test succeeds.
+_RAY_STOP_IF_STALE = (f'[ ! -d {constants.SKY_REMOTE_RAY_TEMPDIR} ] || '
+                      f'{{ {constants.SKY_RAY_CMD} stop; }}')
 
 
 @functools.lru_cache(maxsize=1)
@@ -325,11 +347,19 @@ _READ_RAY_PORT_PY = (
     f'\'{constants.SKY_RUNTIME_DIR_ENV_VAR_KEY}\', \'~\')); '
     'print(json.load(open(os.path.join(d, '
     f'\'{constants.SKY_REMOTE_RAY_PORT_FILE}\')))[\'ray_port\'])')
+# The payload encoding is inlined with stdlib json only — it must match
+# message_utils.encode_payload's '<sky-payload>{json}</sky-payload>\n'
+# format for the caller's decode_payload. Importing sky.utils.message_utils
+# here would pay the full eager `sky/__init__` import (1.9-2.9 s warm) on
+# EVERY health-check poll, which dominates the per-check cost.
+_ENCODE_RAY_PORT_PAYLOAD_PY = (
+    'import json; '
+    'print(\'<sky-payload>\' + json.dumps({\'ray_port\': $RAY_PORT}) + '
+    '\'</sky-payload>\\n\')')
 _RAY_PORT_COMMAND = (
     f'RAY_PORT=$({constants.SKY_PYTHON_CMD} -c "{_READ_RAY_PORT_PY}" '
     f'2> /dev/null || echo {constants.SKY_REMOTE_RAY_PORT});'
-    f'{constants.SKY_PYTHON_CMD} -c "from sky.utils import message_utils; '
-    'print(message_utils.encode_payload({\'ray_port\': $RAY_PORT}))"')
+    f'{constants.SKY_PYTHON_CMD} -c "{_ENCODE_RAY_PORT_PAYLOAD_PY}"')
 
 # Command that calls `ray status` with SkyPilot's Ray port set.
 RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND = (
@@ -598,6 +628,14 @@ def ray_head_start_command(custom_resource: Optional[str],
     ray_options = (
         # --disable-usage-stats in `ray start` saves 10 seconds of idle wait.
         f'--disable-usage-stats '
+        # --include-dashboard=false starts only a minimal dashboard head
+        # (UsageStatsHead, no frontend): nothing in SkyPilot consumes the
+        # dashboard HTTP API (port 8266 is documented as reserved), and the
+        # full dashboard's startup delays the head raylet by ~1 s because
+        # `ray start` blocks on the dashboard's GCS KV registration before
+        # starting the raylet. The raylet's per-node dashboard agent is
+        # unaffected (it fate-shares with the raylet).
+        f'--include-dashboard=false '
         f'--port=${{SKYPILOT_RAY_PORT:-{constants.SKY_REMOTE_RAY_PORT}}} '
         f'--dashboard-port=${{SKYPILOT_RAY_DASHBOARD_PORT:-'
         f'{constants.SKY_REMOTE_RAY_DASHBOARD_PORT}}} '
@@ -617,7 +655,7 @@ def ray_head_start_command(custom_resource: Optional[str],
             ray_options += f' --{key}={value}'
 
     cmd = (
-        _host_network_probe_cmd('head') + f'{constants.SKY_RAY_CMD} stop; '
+        _host_network_probe_cmd('head') + f'{_RAY_STOP_IF_STALE}; '
         'RAY_SCHEDULER_EVENTS=0 RAY_DEDUP_LOGS=0 '
         # worker_maximum_startup_concurrency controls the maximum number of
         # workers that can be started concurrently. However, it also controls
@@ -679,9 +717,10 @@ def ray_worker_start_command(custom_resource: Optional[str],
             'grep "gcs-address=${SKYPILOT_RAY_HEAD_IP}:${SKYPILOT_RAY_PORT}" '
             f'|| {{ {_host_network_probe_cmd("worker")}{cmd} }}')
         return cmd
-    # `ray stop` first, so the ports really are free by the time the probe
-    # runs and the assertion means what it says.
-    cmd = f'{constants.SKY_RAY_CMD} stop; ' + cmd
+    # `ray stop` first (when a previous session may exist), so the ports
+    # really are free by the time the probe runs and the assertion means
+    # what it says.
+    cmd = f'{_RAY_STOP_IF_STALE}; ' + cmd
     return _host_network_probe_cmd('worker') + cmd
 
 
