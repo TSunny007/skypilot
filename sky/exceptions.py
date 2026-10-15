@@ -6,14 +6,19 @@ import types
 import typing
 from typing import Any, Dict, List, Optional, Sequence
 
-from sky.backends import backend
+from sky.adaptors import common as adaptors_common
 from sky.utils import env_options
 from sky.utils import serialize_utils
 
 if typing.TYPE_CHECKING:
     from sky import jobs as managed_jobs
+    from sky.backends import backend
     from sky.skylet import job_lib
     from sky.utils import status_lib
+else:
+    # Lazy: sky.backends imports most of SkyPilot, and nearly every module
+    # imports this one.
+    backend = adaptors_common.LazyImport('sky.backends.backend')
 
 # Return code for keyboard interruption and SIGTSTP
 KEYBOARD_INTERRUPT_CODE = 130

@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import colorama
 import filelock
 
-from sky import global_user_state
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.skylet import constants
@@ -32,10 +31,14 @@ from sky.utils.db import db_utils
 if typing.TYPE_CHECKING:
     import psutil
 
+    from sky import global_user_state
     from sky.schemas.generated import jobsv1_pb2
 else:
     psutil = adaptors_common.LazyImport('psutil')
     jobsv1_pb2 = adaptors_common.LazyImport('sky.schemas.generated.jobsv1_pb2')
+    # Lazy: only needed client-side (load_job_queue); importing it on the
+    # cluster pulls in sqlalchemy, alembic and the config schema.
+    global_user_state = adaptors_common.LazyImport('sky.global_user_state')
 
 logger = sky_logging.init_logger(__name__)
 

@@ -24,26 +24,32 @@ import typing
 from typing import Any, Callable, Dict, List, Optional, Union
 import uuid
 
-import jsonschema
-
 from sky import exceptions
-from sky import models
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.skylet import constants
 from sky.utils import context
 from sky.utils import ux_utils
-from sky.utils import validator
 
 if typing.TYPE_CHECKING:
     import webbrowser
 
     import jinja2
+    import jsonschema
     import psutil
+
+    from sky import models
+    from sky.utils import validator
 else:
     jinja2 = adaptors_common.LazyImport('jinja2')
     psutil = adaptors_common.LazyImport('psutil')
     webbrowser = adaptors_common.LazyImport('webbrowser')
+    # Lazy: this module is imported nearly everywhere, including by on-cluster
+    # code, while jsonschema (schema validation) and pydantic (via models) are
+    # only needed by a few functions.
+    jsonschema = adaptors_common.LazyImport('jsonschema')
+    models = adaptors_common.LazyImport('sky.models')
+    validator = adaptors_common.LazyImport('sky.utils.validator')
 
 USER_HASH_FILE = os.path.expanduser('~/.sky/user_hash')
 USER_HASH_LENGTH = 8
