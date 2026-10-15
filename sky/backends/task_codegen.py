@@ -411,12 +411,24 @@ class RayCodeGen(TaskCodeGen):
             futures = []
             """))
 
-        self._add_logging_functions()
-
+        # The per-node task runner is stdlib-only (see the contract on
+        # log_lib.run_task_script_with_log_and_return_pid): Ray workers
+        # unpickle and run it without importing sky. Before, the runner
+        # pulled in run_with_log's sky dependencies, so the first task on
+        # every node paid the eager `import sky` (plus bytecode compiles on
+        # fresh pods) -- several seconds, on the critical path of every job.
+        # make_task_bash_script is inlined only for the driver, which renders
+        # each node's final script on the head.
         self._code += [
-            'run_bash_command_with_log = run_bash_command_with_log',
-            'run_bash_command_with_log_and_return_pid = \
-                ray.remote(run_bash_command_with_log_and_return_pid)',
+            textwrap.dedent("""\
+            import importlib.util
+            import signal
+            """),
+            inspect.getsource(log_lib.make_task_bash_script),
+            inspect.getsource(log_lib._start_subprocess_daemon),  # pylint: disable=protected-access
+            inspect.getsource(log_lib.run_task_script_with_log_and_return_pid),
+            'run_task_script_with_log_and_return_pid = '
+            'ray.remote(run_task_script_with_log_and_return_pid)',
             'autostop_lib.set_last_active_time_to_now()',
             f'job_lib.set_status({job_id!r}, job_lib.JobStatus.PENDING)',
         ]
@@ -499,7 +511,7 @@ class RayCodeGen(TaskCodeGen):
                 total_num_nodes = len(alive_nodes)
                 setup_bundles = [{{"CPU": _SETUP_CPUS}} for _ in range(total_num_nodes)]
                 setup_pg = ray.util.placement_group(setup_bundles, strategy='STRICT_SPREAD')
-                setup_workers = [run_bash_command_with_log_and_return_pid \\
+                setup_workers = [run_task_script_with_log_and_return_pid \\
                     .options(
                         name='setup',
                         num_cpus=_SETUP_CPUS,
@@ -508,11 +520,8 @@ class RayCodeGen(TaskCodeGen):
                             placement_group_bundle_index=i)
                     ) \\
                     .remote(
-                        setup_cmd,
+                        make_task_bash_script(setup_cmd, env_vars={setup_envs!r}),
                         os.path.expanduser({setup_log_path!r}),
-                        env_vars={setup_envs!r},
-                        stream_logs=True,
-                        with_ray=True,
                     ) for i in range(total_num_nodes)]
                 setup_returncodes, setup_pids = get_or_fail(setup_workers, setup_pg)
                 success = True
@@ -671,14 +680,12 @@ class RayCodeGen(TaskCodeGen):
 
             sky_env_vars_dict['SKYPILOT_INTERNAL_JOB_ID'] = {self.job_id}
 
-            futures.append(run_bash_command_with_log_and_return_pid \\
+            futures.append(run_task_script_with_log_and_return_pid \\
                     .options(name=name_str, {options_str}) \\
                     .remote(
-                        script,
+                        make_task_bash_script(script,
+                                              env_vars=sky_env_vars_dict),
                         log_path,
-                        env_vars=sky_env_vars_dict,
-                        stream_logs=True,
-                        with_ray=True,
                     ))""")
         ]
 
