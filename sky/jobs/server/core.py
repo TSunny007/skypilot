@@ -1,12 +1,15 @@
 """SDK functions for managed jobs."""
 import contextlib
 import copy
+import dataclasses
 import datetime
 import inspect
 import ipaddress
+import json
 import os
 import pathlib
 import shlex
+import shutil
 import sys
 import tempfile
 import time
@@ -38,6 +41,7 @@ from sky.data import data_utils
 from sky.data import storage as storage_lib
 from sky.jobs import constants as managed_job_constants
 from sky.jobs import runner as managed_job_runner
+from sky.jobs import scheduler as managed_job_scheduler
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
 from sky.metrics import utils as metrics_lib
@@ -46,6 +50,7 @@ from sky.schemas.api import responses
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve.server import impl
+from sky.server import clean_env
 from sky.server import plugin_hooks
 from sky.server.requests import request_names
 from sky.skylet import constants as skylet_constants
@@ -77,6 +82,11 @@ else:
         'sky.schemas.generated.managed_jobsv1_pb2')
 
 logger = sky_logging.init_logger(__name__)
+
+# Set to 0 or false on the API server to hand consolidation-mode job
+# submissions to the scheduler in a subprocess, as before, rather than in the
+# request worker (see _submit_in_process).
+_ENV_VAR_IN_PROCESS_SUBMIT = 'SKYPILOT_JOBS_IN_PROCESS_SUBMIT'
 
 _MANAGED_JOB_FIELDS_FOR_QUEUE_KUBERNETES = [
     'job_id',
@@ -428,39 +438,203 @@ class _DefaultManagedJobRunner:
                                              task=task)
 
 
+@dataclasses.dataclass(frozen=True)
+class _SchedulerSubmission:
+    """What the controller task's run script hands the scheduler.
+
+    See the run section of sky/templates/jobs-controller.yaml.j2. The paths
+    are the controller-side ('~/...') paths of the staged files.
+    """
+    dag_yaml_path: str
+    original_user_yaml_path: str
+    env_file_path: str
+    controller_envs: Dict[str, str]
+    job_id_to_rank: Dict[str, int]
+    priority: int
+    priority_class: Optional[str]
+
+
+def _in_process_submit_enabled() -> bool:
+    return os.environ.get(_ENV_VAR_IN_PROCESS_SUBMIT,
+                          '1').strip().lower() not in ('0', 'false')
+
+
+def _copy_file_atomically(src: str, dst: str) -> None:
+    """Copy src to dst with its mode and times, as `rsync -a` would.
+
+    Through a temporary file in dst's directory, so a reader never sees a
+    partly written dst.
+    """
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(dst),
+                                    prefix=f'.{os.path.basename(dst)}.')
+    os.close(fd)
+    try:
+        shutil.copy2(src, tmp_path)
+        os.replace(tmp_path, dst)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
+def _stage_file_mounts_locally(handle: backends.ResourceHandle,
+                               controller_task: 'sky.Task') -> bool:
+    """Put the controller task's file mounts in place with local copies.
+
+    In consolidation mode the controller is this host, and its file mounts
+    are a few local files under '~/' (the DAG, the user's YAML and the
+    config). backend.sync_file_mounts would rsync each of them to this same
+    host, one subprocess at a time (~0.4 s); this copies them instead, after
+    the same config rewrite (replace_skypilot_config_path_in_file_mounts).
+
+    Returns:
+        Whether the mounts were staged. False, with nothing copied, if any
+        mount is not a plain local file under '~/', so the caller can sync
+        them with the backend as before.
+    """
+    if controller_task.storage_mounts:
+        return False
+    file_mounts = dict(controller_task.file_mounts or {})
+    for dst, src in file_mounts.items():
+        if src is None:
+            # replace_skypilot_config_path_in_file_mounts drops these.
+            continue
+        if (not dst.startswith('~/') or data_utils.is_cloud_store_url(src) or
+                not os.path.isfile(os.path.expanduser(src))):
+            return False
+    assert isinstance(handle, cloud_vm_ray_backend.CloudVmRayResourceHandle)
+    controller_utils.replace_skypilot_config_path_in_file_mounts(
+        handle.launched_resources.assert_launchable().cloud, file_mounts)
+    for dst, src in file_mounts.items():
+        _copy_file_atomically(os.path.expanduser(src), os.path.expanduser(dst))
+    return True
+
+
+def _append_controller_env_file(env_file_path: str, controller_envs: Dict[str,
+                                                                          str],
+                                job_id_to_rank: Dict[str, int]) -> None:
+    """Write the env file as the controller task's run script does.
+
+    Line for line what the script's `echo "export K='V'" >> env_file` and
+    its SKYPILOT_JOB_ID_TO_RANK one-liner produce. Jinja's tojson sorts the
+    keys, and the one-liner keeps that order.
+    """
+    lines = [
+        f'export {name}=\'{value}\'\n'
+        for name, value in controller_envs.items()
+    ]
+    lines.append('export SKYPILOT_JOB_ID_TO_RANK=' +
+                 shlex.quote(json.dumps(job_id_to_rank, sort_keys=True)) + '\n')
+    os.makedirs(os.path.dirname(env_file_path), exist_ok=True)
+    # Appends, like the script's `>>`.
+    with open(env_file_path, 'a', encoding='utf-8') as f:
+        f.writelines(lines)
+
+
+def _append_submit_log(log_path: str, message: str) -> None:
+    with open(log_path, 'a', encoding='utf-8') as f:
+        f.write(f'{datetime.datetime.now().isoformat(sep=" ")} {message}\n')
+
+
+def _submit_in_process(job_ids: List[int], submission: _SchedulerSubmission,
+                       log_path: str) -> None:
+    """Do the controller task's run script in this request worker.
+
+    The script (sky/templates/jobs-controller.yaml.j2) writes the env file,
+    then runs `python -m sky.jobs.scheduler`, which stores the staged files
+    in the job rows and moves the jobs to WAITING. Spawning that costs ~1.9 s,
+    nearly all of it a cold `import sky`; this worker has it loaded already.
+
+    It keeps everything the subprocess got right:
+    - Environment. The subprocess ran in the clean server env, so that
+      per-request env did not leak into controllers it might start. It starts
+      none in consolidation mode (scheduler.maybe_start_controllers), and
+      this path starts no process at all. The one variable the scheduler
+      read, SKYPILOT_CONFIG, resolves as it did there: the controller env
+      first, then the clean server env.
+    - DB, user and workspace. The job rows were written in this process
+      (_maybe_submit_job_locally), with the user and workspace of the
+      request; the WAITING update goes to the same DB and reads neither.
+    - Files and the submit log. The env file and the staged files are where
+      the script put them, and the log gets a line per submission.
+    Unlike the script, whose exit code nobody checked, a failure here is
+    logged and raised, so the request fails instead of leaving the jobs
+    PENDING forever.
+    """
+    env_file_path = os.path.expanduser(submission.env_file_path)
+    _append_controller_env_file(env_file_path, submission.controller_envs,
+                                submission.job_id_to_rank)
+    config_file_path = submission.controller_envs.get(
+        skypilot_config.ENV_VAR_SKYPILOT_CONFIG)
+    if config_file_path is None:
+        server_env = clean_env.get_clean_server_env()
+        config_file_path = (server_env
+                            if server_env is not None else os.environ).get(
+                                skypilot_config.ENV_VAR_SKYPILOT_CONFIG)
+    job_ids_str = _job_ids_to_str(job_ids)
+    try:
+        managed_job_scheduler.set_jobs_waiting(
+            job_ids,
+            os.path.expanduser(submission.dag_yaml_path),
+            os.path.expanduser(submission.original_user_yaml_path),
+            env_file_path,
+            config_file_path,
+            submission.priority,
+            priority_class=submission.priority_class)
+    except Exception as e:  # pylint: disable=broad-except
+        _append_submit_log(
+            log_path, f'Failed to submit job(s) {job_ids_str} to the '
+            f'scheduler: {common_utils.format_exception(e)}')
+        raise
+    _append_submit_log(
+        log_path, f'Submitted job(s) {job_ids_str} in-process: WAITING. '
+        'Controller startup is owned by the managed-job refresh daemon.')
+
+
 def _consolidated_launch(
     controller: controller_utils.Controllers,
     controller_task: 'sky.Task',
     job_ids: List[int],
+    submission: Optional[_SchedulerSubmission] = None,
 ) -> Tuple[List[int], backends.ResourceHandle]:
     local_handle = backend_utils.is_controller_accessible(controller=controller,
                                                           stopped_message='')
     backend = backend_utils.get_backend_from_handle(local_handle)
     assert isinstance(backend, backends.CloudVmRayBackend)
-    with sky_logging.silent():
-        backend.sync_file_mounts(handle=local_handle,
-                                 all_file_mounts=controller_task.file_mounts,
-                                 storage_mounts=controller_task.storage_mounts)
-    run_script = controller_task.run
-    assert isinstance(run_script, str)
-    # Manually add the env variables to the run script.
-    # Originally this is done in ray jobs submission but now
-    # we have to do it manually because there is no ray
-    # runtime on the API server.
-    env_cmds = [f'export {k}={v!r}' for k, v in controller_task.envs.items()]
-    run_script = '\n'.join(env_cmds + [run_script])
-    # Dump script for high availability recovery.
+    in_process = submission is not None and _in_process_submit_enabled()
+    if not (in_process and
+            _stage_file_mounts_locally(local_handle, controller_task)):
+        with sky_logging.silent():
+            backend.sync_file_mounts(
+                handle=local_handle,
+                all_file_mounts=controller_task.file_mounts,
+                storage_mounts=controller_task.storage_mounts)
     assert job_ids is not None, 'job_ids not set'
     log_dir = os.path.expanduser(
         os.path.join(skylet_constants.SKY_LOGS_DIRECTORY, 'managed_jobs'))
     os.makedirs(log_dir, exist_ok=True)
     job_ids_str = _job_ids_to_str(job_ids)
     log_path = os.path.join(log_dir, f'submit-job-{job_ids_str}.log')
-    # LocalProcessCommandRunner (used for consolidation-mode spawns) sets
-    # a clean server env on the subprocess by default to keep per-request
-    # env pollution from leaking into the long-lived controller process
-    # tree. See LocalProcessCommandRunner.run for details.
-    backend.run_on_head(local_handle, run_script, log_path=log_path)
+    if in_process:
+        assert submission is not None
+        _submit_in_process(job_ids, submission, log_path)
+    else:
+        run_script = controller_task.run
+        assert isinstance(run_script, str)
+        # Manually add the env variables to the run script.
+        # Originally this is done in ray jobs submission but now
+        # we have to do it manually because there is no ray
+        # runtime on the API server.
+        env_cmds = [
+            f'export {k}={v!r}' for k, v in controller_task.envs.items()
+        ]
+        run_script = '\n'.join(env_cmds + [run_script])
+        # LocalProcessCommandRunner (used for consolidation-mode spawns) sets
+        # a clean server env on the subprocess by default to keep per-request
+        # env pollution from leaking into the long-lived controller process
+        # tree. See LocalProcessCommandRunner.run for details.
+        backend.run_on_head(local_handle, run_script, log_path=log_path)
     ux_utils.starting_message(f'Job submitted, ID: {job_ids_str}')
     return job_ids, local_handle
 
@@ -1371,8 +1545,17 @@ def _launch(
                 # intermediate bucket and newly created bucket should be in
                 # workspace A.
                 if is_consolidation_mode:
+                    submission = _SchedulerSubmission(
+                        dag_yaml_path=remote_user_yaml_path,
+                        original_user_yaml_path=remote_orig_user_yaml_path,
+                        env_file_path=remote_env_file_path,
+                        controller_envs=dict(
+                            vars_to_fill.get('controller_envs', {})),
+                        job_id_to_rank=job_id_to_rank,
+                        priority=priority,
+                        priority_class=priority_class)
                     return _consolidated_launch(controller, controller_task,
-                                                job_ids)
+                                                job_ids, submission)
                 else:
                     # TODO(lloyd-brown) The cluster should already be launched
                     # here so we should just be able to use exec, but we need
