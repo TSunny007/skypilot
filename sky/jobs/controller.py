@@ -90,6 +90,21 @@ _LIVE_LINK_MAX_ATTEMPTS = 30  # give up live updates after ~30 attempts
 # database connections and finish together, so the loops never drift apart.
 _STATUS_CHECK_GAP_JITTER = 0.2
 
+# Right after a fresh launch the job is queued and may finish within seconds,
+# so the monitor checks it every _FRESH_LAUNCH_CHECK_GAP_SECONDS for the first
+# _FRESH_LAUNCH_FAST_CHECK_SECONDS instead of waiting up to a full gap. This
+# adds a bounded number of status reads per launch, not steady-state load.
+_FRESH_LAUNCH_FAST_CHECK_SECONDS = 30
+_FRESH_LAUNCH_CHECK_GAP_SECONDS = 2
+
+# While a multi-node job reads as live, the full cluster refresh (the cloud
+# API, then a `ray status` and an autostop check on the head, ~6 s over
+# `kubectl exec`) runs at most this often. It catches a partial preemption
+# that the job itself does not fail on; a status read that fails or a
+# terminal status still refreshes at once. Before, it ran on every tick,
+# which stretched the tick period to 24-28 s.
+_MULTI_NODE_REFRESH_GAP_SECONDS = 60
+
 
 def _status_check_gap_seconds(first_check: bool) -> float:
     """Returns how long the monitor loop waits before a job status check.
@@ -1142,6 +1157,8 @@ class JobController:
             callback_func=callback_func,
             cleanup_cluster_on_success=True,
             force_transit_to_recovering=force_transit_to_recovering,
+            # A pool's exec does not check the worker cluster's health.
+            fresh_launch=not is_resume and self._pool is None,
         )
 
     async def _run_batch_coordinator_task(
@@ -1265,6 +1282,7 @@ class JobController:
         cleanup_cluster_on_success: bool = True,
         force_transit_to_recovering: bool = False,
         on_recovery: Optional[typing.Callable[[], typing.Coroutine]] = None,
+        fresh_launch: bool = False,
     ) -> bool:
         """Monitor a single task until completion with recovery support.
 
@@ -1287,6 +1305,9 @@ class JobController:
                 iteration (used when resuming from controller failure).
             on_recovery: Optional async callback called after recovery.
                 Used by JobGroups to re-setup networking.
+            fresh_launch: The task's cluster was just launched (not resumed
+                after a controller restart): check the job often at first,
+                and trust the launch's view of the cluster for a while.
 
         Returns:
             True if the task succeeded, False otherwise.
@@ -1310,6 +1331,7 @@ class JobController:
                 force_transit_to_recovering=force_transit_to_recovering,
                 on_recovery=on_recovery,
                 status_logger=status_logger,
+                fresh_launch=fresh_launch,
             )
         finally:
             status_logger.flush()
@@ -1326,6 +1348,7 @@ class JobController:
         cleanup_cluster_on_success: bool = True,
         force_transit_to_recovering: bool = False,
         on_recovery: Optional[typing.Callable[[], typing.Coroutine]] = None,
+        fresh_launch: bool = False,
     ) -> bool:
         """Body of the monitoring loop; see _monitor_one_task for the contract.
 
@@ -1345,6 +1368,14 @@ class JobController:
         live_link_attempts = 0
         live_link_poll_counter = 0
         first_status_check = True
+        # Until when (time.monotonic()) to check the job every
+        # _FRESH_LAUNCH_CHECK_GAP_SECONDS.
+        fast_checks_until = (time.monotonic() + _FRESH_LAUNCH_FAST_CHECK_SECONDS
+                             if fresh_launch else None)
+        # When (time.monotonic()) the cluster was last seen fully healthy:
+        # by the launch that just completed, a recovery, or a full refresh.
+        # None until then, e.g. after a controller restart.
+        cluster_healthy_at = time.monotonic() if fresh_launch else None
         # The last runtime observation persisted for this task, which the
         # runtime receives as `previous`. It is read from the database before
         # the first dispatch and again after each recovery, whose relaunch
@@ -1369,8 +1400,11 @@ class JobController:
             # value never leaks into the on_before_recovery hook.
             exit_codes: Optional[List[int]] = None
 
+            in_fast_checks = (fast_checks_until is not None and
+                              time.monotonic() < fast_checks_until)
             if not force_transit_to_recovering:
                 await asyncio.sleep(
+                    _FRESH_LAUNCH_CHECK_GAP_SECONDS if in_fast_checks else
                     _status_check_gap_seconds(first_check=first_status_check))
                 first_status_check = False
 
@@ -1451,8 +1485,10 @@ class JobController:
                 # guarantee). Throttled and capped so a job that never prints a
                 # matching URL does not trigger a job-queue read on every poll
                 # (which is an SSH round-trip on non-gRPC clusters).
+                # Not during the fast checks: the scan is a head round trip
+                # of its own, and would hold up the next check.
                 if (job_status is not None and not job_status.is_terminal() and
-                        not live_link_done and
+                        not in_fast_checks and not live_link_done and
                         live_link_attempts < _LIVE_LINK_MAX_ATTEMPTS):
                     live_link_poll_counter += 1
                     if live_link_poll_counter % _LIVE_LINK_POLL_EVERY == 1:
@@ -1582,7 +1618,9 @@ class JobController:
             # nodes are preempted or failed, need to check the actual cluster
             # status.
             if (job_status is not None and not job_status.is_terminal() and
-                    task.num_nodes == 1):
+                (task.num_nodes == 1 or
+                 (cluster_healthy_at is not None and time.monotonic() -
+                  cluster_healthy_at < _MULTI_NODE_REFRESH_GAP_SECONDS))):
                 continue
 
             if job_status in job_lib.JobStatus.user_code_failure_states():
@@ -1713,6 +1751,7 @@ class JobController:
                 # Cluster is UP
                 if job_status is not None and not job_status.is_terminal():
                     # The multi-node job is still running, continue monitoring.
+                    cluster_healthy_at = time.monotonic()
                     continue
                 elif (job_status
                       in job_lib.JobStatus.user_code_failure_states() or
@@ -2035,6 +2074,10 @@ class JobController:
             recovered_time = await executor.recover()
             # The relaunch may have persisted runtime observations of its own.
             runtime_cursor_stale = True
+            if not managed_job_runtime.is_registered():
+                # The recovery refreshed the relaunched cluster's status
+                # before returning (see _wait_until_job_starts_on_cluster).
+                cluster_healthy_at = time.monotonic()
 
             # Update cluster_name for pools after recovery
             if self._pool is not None:
