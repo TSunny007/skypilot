@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from sky.adaptors import kubernetes
 from sky.provision import common
+from sky.provision.kubernetes import fast_start
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.utils import yaml_utils
 
@@ -19,12 +20,15 @@ DELETION_TIMEOUT = 90
 def bootstrap_instances(
         region: str, cluster_name: str,
         config: common.ProvisionConfig) -> common.ProvisionConfig:
-    del region, cluster_name  # unused
+    del region  # unused
     namespace = kubernetes_utils.get_namespace_from_config(
         config.provider_config)
     context = kubernetes_utils.get_context_from_config(config.provider_config)
 
     _configure_services(namespace, context, config.provider_config)
+    # Before the pods exist: they mount these objects.
+    fast_start.create_objects(namespace, context, cluster_name,
+                              config.provider_config)
 
     requested_service_account = config.node_config['spec']['serviceAccountName']
     if config.provider_config.get('remote_identity_none', False):
