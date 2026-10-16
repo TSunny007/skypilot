@@ -4083,3 +4083,132 @@ class TestJobGroupResumeWithFinishedPrimaries:
         for task in asyncio.all_tasks():
             if task is not asyncio.current_task():
                 task.cancel()
+
+
+class TestMonitorSchedule:
+    """How often the monitor checks a job, and when a multi-node tick also
+    refreshes the whole cluster."""
+
+    class _StopLoop(Exception):
+        """Sentinel to break the otherwise-infinite monitoring loop."""
+
+    async def _run(self,
+                   statuses,
+                   fresh_launch,
+                   clock,
+                   num_nodes=4,
+                   stop_at_refresh=False):
+        """Drive the loop through one status read per entry of statuses."""
+        task = MagicMock()
+        task.num_nodes = num_nodes
+        instance = MagicMock()
+        instance._job_id = 1
+        instance._pool = None
+        instance._update_live_log_links = AsyncMock(return_value=False)
+        reads = iter(statuses)
+        sleeps = []
+
+        async def fake_status(*args, **kwargs):
+            del args, kwargs
+            try:
+                return next(reads), None
+            except StopIteration:
+                raise TestMonitorSchedule._StopLoop() from None
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+            clock['t'] += seconds
+
+        def fake_refresh(*args, **kwargs):
+            del args, kwargs
+            if stop_at_refresh:
+                raise TestMonitorSchedule._StopLoop()
+            clock['t'] += 6
+            return status_lib.ClusterStatus.UP, MagicMock()
+
+        with patch.object(controller_module.time, 'monotonic',
+                          side_effect=lambda: clock['t']), \
+             patch.object(managed_job_utils, 'get_job_status',
+                          side_effect=fake_status), \
+             patch.object(controller_module.backend_utils,
+                          'refresh_cluster_status_handle',
+                          side_effect=fake_refresh) as refresh, \
+             patch.object(controller_module.backend_utils,
+                          'async_check_network_connection',
+                          new=AsyncMock(return_value=None)), \
+             patch.object(controller_module.managed_job_runtime,
+                          'is_registered', return_value=False), \
+             patch.object(controller_module.asyncio, 'sleep',
+                          side_effect=fake_sleep):
+            with pytest.raises(TestMonitorSchedule._StopLoop):
+                await JobController._monitor_one_task_impl(
+                    instance,
+                    task_id=0,
+                    task=task,
+                    cluster_name='cluster',
+                    executor=MagicMock(),
+                    status_logger=managed_job_utils.JobStatusLogger(),
+                    callback_func=AsyncMock(),
+                    fresh_launch=fresh_launch)
+        return sleeps, refresh, instance
+
+    @pytest.mark.asyncio
+    async def test_fresh_launch_checks_often_and_trusts_the_launch(self):
+        clock = {'t': 1000.0}
+        running = job_lib.JobStatus.RUNNING
+        sleeps, refresh, instance = await self._run([running] * 3,
+                                                    fresh_launch=True,
+                                                    clock=clock)
+        gap = controller_module._FRESH_LAUNCH_CHECK_GAP_SECONDS
+        # The fourth sleep precedes the read that ends the loop.
+        assert sleeps == [gap] * 4
+        # The launch just saw every node up: no full refresh, and no
+        # live-link scan holding up the next check.
+        refresh.assert_not_called()
+        instance._update_live_log_links.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fresh_checks_end_after_the_window(self):
+        clock = {'t': 1000.0}
+        window = controller_module._FRESH_LAUNCH_FAST_CHECK_SECONDS
+        gap = controller_module._FRESH_LAUNCH_CHECK_GAP_SECONDS
+        n_fast = window // gap
+        sleeps, _, _ = await self._run([job_lib.JobStatus.RUNNING] *
+                                       (n_fast + 1),
+                                       fresh_launch=True,
+                                       clock=clock)
+        assert sleeps[:n_fast] == [gap] * n_fast
+        assert sleeps[n_fast] > gap  # The usual cadence from here on.
+
+    @pytest.mark.asyncio
+    async def test_multi_node_refresh_runs_at_most_every_gap(self):
+        clock = {'t': 1000.0}
+        running = job_lib.JobStatus.RUNNING
+        # Not fresh (e.g. resumed): the first live tick refreshes; later
+        # ones only once _MULTI_NODE_REFRESH_GAP_SECONDS have passed.
+        sleeps, refresh, _ = await self._run([running] * 8,
+                                             fresh_launch=False,
+                                             clock=clock)
+        refresh_gap = controller_module._MULTI_NODE_REFRESH_GAP_SECONDS
+        elapsed = sum(sleeps) + 6 * refresh.call_count
+        assert 1 < refresh.call_count <= 1 + elapsed // refresh_gap
+
+    @pytest.mark.asyncio
+    async def test_single_node_never_refreshes_while_live(self):
+        clock = {'t': 1000.0}
+        _, refresh, _ = await self._run([job_lib.JobStatus.RUNNING] * 3,
+                                        fresh_launch=False,
+                                        clock=clock,
+                                        num_nodes=1)
+        refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_status_read_refreshes_at_once(self):
+        """Even right after a fresh launch, a status read that fails (e.g.
+        the head is gone) checks the cluster."""
+        clock = {'t': 1000.0}
+        _, refresh, _ = await self._run([None],
+                                        fresh_launch=True,
+                                        clock=clock,
+                                        stop_at_refresh=True)
+        refresh.assert_called_once()
