@@ -1168,3 +1168,158 @@ class TestGetJobStatusWithEndTime:
         assert backend.get_job_status_with_end_time(
             handle, 3) == (job_lib.JobStatus.SUCCEEDED, None)
         backend.run_on_head.assert_not_called()
+
+
+class TestAddAndQueueJob:
+    """A fresh jobs-controller cluster gets add_job, the driver and queue in
+    one head round trip instead of four."""
+
+    _DRIVER = 'print("driver ran")\n'
+
+    @pytest.fixture
+    def head(self, tmp_path, monkeypatch):
+        """A real head-side job table and home dir; queue() is recorded."""
+        monkeypatch.setenv('HOME', str(tmp_path))
+        monkeypatch.setattr(job_lib, '_JOB_STATUS_LOCK',
+                            str(tmp_path / 'locks' / '.job_{}.lock'))
+        monkeypatch.setattr(
+            job_lib, '_DB',
+            db_utils.SQLiteConn(str(tmp_path / 'jobs.db'),
+                                job_lib.create_table))
+        queued = []
+        monkeypatch.setattr(job_lib.scheduler, 'queue',
+                            lambda job_id, cmd: queued.append((job_id, cmd)))
+        return types.SimpleNamespace(home=tmp_path, queued=queued)
+
+    @staticmethod
+    def _backend(monkeypatch, grpc=False, by_jobs_controller=True):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        backend._is_launched_by_jobs_controller = by_jobs_controller
+        monkeypatch.setattr(backend, '_build_task_driver',
+                            lambda *args, **kwargs: TestAddAndQueueJob._DRIVER)
+        handle = MagicMock()
+        handle.is_grpc_enabled_with_flag = grpc
+        handle.launched_resources.cloud = clouds.Kubernetes()
+        handle.num_ips_per_node = 1
+        runner = MagicMock()
+        runner.is_command_length_over_limit.return_value = False
+        handle.get_command_runners.return_value = [runner]
+
+        def run_on_head(handle, code, **kwargs):
+            del handle, kwargs
+            return 0, TestGetJobStatusWithEndTime._run_on_head(code), ''
+
+        backend.run_on_head = MagicMock(side_effect=run_on_head)
+        return backend, handle, runner
+
+    @staticmethod
+    def _task(name='train'):
+        return task.Task(name=name, run='echo hi', num_nodes=4)
+
+    def test_fresh_cluster_queues_in_one_exec(self, head, monkeypatch):
+        backend, handle, _ = self._backend(monkeypatch)
+        assert backend._add_and_queue_job(handle, self._task(), '4x[CPU:1]',
+                                          '{}') == (1, '~/sky_logs/1-train',
+                                                    True)
+        backend.run_on_head.assert_called_once()
+        script = head.home / '.sky' / 'sky_app' / 'sky_job_1'
+        assert script.read_text() == self._DRIVER
+        assert (head.home / 'sky_logs' / '1-train' / 'run.log').exists()
+        # The same command the separate queue exec would have queued.
+        assert head.queued == [(1,
+                                cloud_vm_ray_backend._driver_submit_cmd(
+                                    1, '~/.sky/sky_app/sky_job_1',
+                                    '~/sky_logs/1-train/run.log'))]
+
+    def test_unexpected_job_id_is_only_added(self, head, monkeypatch):
+        job_lib.add_job('earlier', 'user', 'sky-0', '1x[CPU:1]')
+        backend, handle, _ = self._backend(monkeypatch)
+        assert backend._add_and_queue_job(handle, self._task(), '4x[CPU:1]',
+                                          '{}') == (2, '~/sky_logs/2-train',
+                                                    False)
+        assert not head.queued
+        assert not (head.home / '.sky' / 'sky_app' / 'sky_job_1').exists()
+
+    def test_older_runtime_only_adds(self, head, monkeypatch):
+        # The head checks its own SKYLET_VERSION: a runtime older than the
+        # one that generated the driver does not queue it.
+        code_version = skylet_constants.SKYLET_VERSION
+        backend, handle, _ = self._backend(monkeypatch)
+        original = backend.run_on_head.side_effect
+
+        def run_on_old_head(handle, code, **kwargs):
+            monkeypatch.setattr(skylet_constants, 'SKYLET_VERSION',
+                                str(int(code_version) - 1))
+            return original(handle, code, **kwargs)
+
+        backend.run_on_head.side_effect = run_on_old_head
+        assert backend._add_and_queue_job(handle, self._task(), '4x[CPU:1]',
+                                          '{}') == (1, '~/sky_logs/1-train',
+                                                    False)
+        assert not head.queued
+
+    @pytest.mark.parametrize('grpc,by_jobs_controller', [(True, True),
+                                                         (False, False)])
+    def test_not_attempted(self, monkeypatch, grpc, by_jobs_controller):
+        backend, handle, _ = self._backend(
+            monkeypatch, grpc=grpc, by_jobs_controller=by_jobs_controller)
+        assert backend._add_and_queue_job(handle, self._task(), '4x[CPU:1]',
+                                          '{}') is None
+        backend.run_on_head.assert_not_called()
+
+    def test_too_long_to_inline_is_not_attempted(self, monkeypatch):
+        backend, handle, runner = self._backend(monkeypatch)
+        runner.is_command_length_over_limit.return_value = True
+        assert backend._add_and_queue_job(handle, self._task(), '4x[CPU:1]',
+                                          '{}') is None
+        backend.run_on_head.assert_not_called()
+
+    def test_queue_failure_fails_the_submit(self, head, monkeypatch):
+
+        def failing_queue(job_id, cmd):
+            raise RuntimeError('queue failed')
+
+        monkeypatch.setattr(job_lib.scheduler, 'queue', failing_queue)
+        backend, handle, _ = self._backend(monkeypatch)
+
+        def run_on_head(handle, code, **kwargs):
+            del handle, kwargs
+            try:
+                return 0, TestGetJobStatusWithEndTime._run_on_head(code), ''
+            except RuntimeError as e:
+                return 1, 'Job ID: 1\nLog Dir: ~/sky_logs/1-train\n', str(e)
+
+        backend.run_on_head.side_effect = run_on_head
+        with pytest.raises(exceptions.CommandError, match='Failed to submit'):
+            backend._add_and_queue_job(handle, self._task(), '4x[CPU:1]', '{}')
+
+    @pytest.mark.parametrize('added,expect_execute', [
+        ((1, '~/sky_logs/1-train', True), False),
+        ((2, '~/sky_logs/2-train', False), True),
+        (None, True),
+    ])
+    def test_execute_submits_only_what_was_not_queued(self, monkeypatch, added,
+                                                      expect_execute):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = MagicMock()
+        handle.provision_runtime_metadata.run_started = False
+        handle.num_ips_per_node = 1
+        monkeypatch.setattr(backend, 'check_resources_fit_cluster',
+                            lambda *args, **kwargs: resources.Resources())
+        monkeypatch.setattr(backend, '_record_job_spec', MagicMock())
+        monkeypatch.setattr(backend, '_add_and_queue_job',
+                            MagicMock(return_value=added))
+        monkeypatch.setattr(backend, '_add_job',
+                            MagicMock(return_value=(3, '~/sky_logs/3-train')))
+        n_nodes = MagicMock()
+        monkeypatch.setattr(backend, '_execute_task_n_nodes', n_nodes)
+
+        job_id = backend._execute(handle, self._task())
+        expected = added if added is not None else (3, '~/sky_logs/3-train')
+        assert job_id == expected[0]
+        assert backend._add_job.called == (added is None)
+        if expect_execute:
+            n_nodes.assert_called_once()
+            assert n_nodes.call_args.args[2:] == (expected[0], expected[1])
+        else:
+            n_nodes.assert_not_called()

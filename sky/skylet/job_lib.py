@@ -1216,9 +1216,60 @@ class JobLibCodeGen:
     @classmethod
     def add_job(cls, job_name: Optional[str], username: str, run_timestamp: str,
                 resources_str: str, metadata: str) -> str:
+        return cls._build(
+            cls._add_job_code(job_name, username, run_timestamp, resources_str,
+                              metadata))
+
+    @classmethod
+    def add_and_queue_job(cls, job_name: Optional[str], username: str,
+                          run_timestamp: str, resources_str: str, metadata: str,
+                          expected_job_id: int, expected_log_dir: str,
+                          script_path: str, compressed_driver: str,
+                          job_submit_cmd: str) -> str:
+        """add_job, then write the driver and queue it, in one round trip.
+
+        The driver and job_submit_cmd were generated for expected_job_id and
+        expected_log_dir, so they are written and queued only if add_job
+        returns exactly those, and only on a runtime at least as new as this
+        one. Otherwise only the job is added, with the same output as
+        add_job, and the caller submits it the usual way. "Job queued: <id>"
+        is printed once the job is queued.
+
+        compressed_driver is the driver, zlib-compressed and base64-encoded,
+        to keep the inlined command small.
+        """
+        remote_log_path = os.path.join(expected_log_dir, 'run.log')
+        code = cls._add_job_code(job_name, username, run_timestamp,
+                                 resources_str, metadata)
+        code += [
+            # A compound statement: the leading '\n' starts a new logical
+            # line at column 0 (_build joins the statements with ';').
+            '\nif (isinstance(result, tuple) and '
+            f'int(constants.SKYLET_VERSION) >= {int(constants.SKYLET_VERSION)}'
+            f' and tuple(result) == ({expected_job_id!r}, '
+            f'{expected_log_dir!r})):'
+            '\n  import base64, zlib'
+            f'\n  os.makedirs(os.path.expanduser({expected_log_dir!r}), '
+            'exist_ok=True)'
+            f'\n  open(os.path.expanduser({remote_log_path!r}), "a").close()'
+            f'\n  script_path = os.path.expanduser({script_path!r})'
+            '\n  os.makedirs(os.path.dirname(script_path), exist_ok=True)'
+            '\n  with open(script_path, "w", encoding="utf-8") as f:'
+            '\n    f.write(zlib.decompress(base64.b64decode('
+            f'{compressed_driver!r})).decode("utf-8"))'
+            f'\n  job_lib.scheduler.queue({expected_job_id!r}, '
+            f'{job_submit_cmd!r})'
+            f'\n  print("Job queued: {expected_job_id}", flush=True)',
+        ]
+        return cls._build(code)
+
+    @classmethod
+    def _add_job_code(cls, job_name: Optional[str], username: str,
+                      run_timestamp: str, resources_str: str,
+                      metadata: str) -> List[str]:
         if job_name is None:
             job_name = '-'
-        code = [
+        return [
             # We disallow job submission when SKYLET_VERSION is older than 9, as
             # it was using ray job submit before #4318, and switched to raw
             # process. Using the old skylet version will cause the job status
@@ -1246,7 +1297,6 @@ class JobLibCodeGen:
              '\nelse:'
              '\n  print("Job ID: " + str(result), flush=True)'),
         ]
-        return cls._build(code)
 
     @classmethod
     def set_job_info_without_job_id(cls,
