@@ -1,3 +1,48 @@
+# Launch-latency work trial: start here
+
+This fork holds a work trial on SkyPilot's multi-node managed-job launch latency on Kubernetes.
+
+**The result.** A 4-node managed job on a local Kind cluster used to take **54.15 s** from `sky jobs launch` until every rank's `run:` had started (mean of 4 warm trials). On [`ll/benchmarked-stack`](https://github.com/TSunny007/skypilot/tree/ll/benchmarked-stack) with the opt-in `kubernetes.fast_start: true`, it takes **26.65 s**: 26.40 and 26.90 s over 2 trials, −51%.
+- **The main change is structural.** A managed-job pod now carries its job and starts it itself. Before, the API server host waited for Ray and then pushed the job through a serial chain of `kubectl exec` calls.
+- **It ships alongside** cheaper Ray startup, a faster control plane and lazy imports. No run isolates each part's share.
+- **Where the remaining 27 s goes** is measured: the host's wheel install takes 7.7 s, a cold `import sky` on the head plus the Ray dispatch take most of the rest, and there's a hidden 6 s DNS wait. The next levers are listed with each one.
+- **Scope of the evidence.** Everything was measured on one 8-core Kind node. The docs tag each claim as measured [V], read in code [C] or estimated [H].
+
+## Where to look, in order
+0. **[`LAUNCH_LATENCY.md`](LAUNCH_LATENCY.md)**: the 2-page design doc (diagnosis, design, results, limitations, what is not done, how far it can go, and the "Kubernetes-only SkyPilot" launch path).
+1. **[`ll/consolidated`](https://github.com/TSunny007/skypilot/tree/ll/consolidated)** has all the code plus the `bench/` docs:
+   - [`DESIGN.md`](https://github.com/TSunny007/skypilot/blob/ll/consolidated/bench/DESIGN.md): the Self-Starting Pods proposal;
+   - [`ANALYSIS.md`](https://github.com/TSunny007/skypilot/blob/ll/consolidated/bench/ANALYSIS.md): the measured diagnosis of the original 54 s;
+   - [`notes.md`](https://github.com/TSunny007/skypilot/blob/ll/consolidated/bench/notes.md): every result, in order. The last sections cover the headline.
+2. **[`ll/benchmarked-stack`](https://github.com/TSunny007/skypilot/tree/ll/benchmarked-stack)** is the exact tree that measured 26.65 s. Its PR has the per-stage table and the breakdown of the remaining time.
+3. **PRs [#1](https://github.com/TSunny007/skypilot/pull/1)–[#6](https://github.com/TSunny007/skypilot/pull/6)** are the review-sized diffs, one per area (table below); see all [open pull requests](https://github.com/TSunny007/skypilot/pulls).
+
+## Branches
+| Branch | PR | What it holds | Base |
+|---|---|---|---|
+| [`ll/consolidated`](https://github.com/TSunny007/skypilot/tree/ll/consolidated) | [#8](https://github.com/TSunny007/skypilot/pull/8) | Everything: all code below plus `bench/` docs and harness. Partly benchmarked | master |
+| [`ll/benchmarked-stack`](https://github.com/TSunny007/skypilot/tree/ll/benchmarked-stack) | [#7](https://github.com/TSunny007/skypilot/pull/7) | The exact measured tree: A1 + A2 + A3 (3 commits) + C (4 commits) + B | master |
+| [`ll/1-control-plane`](https://github.com/TSunny007/skypilot/tree/ll/1-control-plane) | [#1](https://github.com/TSunny007/skypilot/pull/1) | A1: in-process job submit; wake an idle controller instead of a 10 s poll; parallel Service creates | master |
+| [`ll/2-lazy-imports`](https://github.com/TSunny007/skypilot/tree/ll/2-lazy-imports) | [#5](https://github.com/TSunny007/skypilot/pull/5) | A2: lazy `import sky`; import cycles broken; slimmer on-cluster imports | master |
+| [`ll/3-status-and-submit`](https://github.com/TSunny007/skypilot/tree/ll/3-status-and-submit) | [#2](https://github.com/TSunny007/skypilot/pull/2) | A3: RUNNING right after launch; end time in the status read; add + queue in one exec; monitor schedule | master |
+| [`ll/4-ray-levers`](https://github.com/TSunny007/skypilot/tree/ll/4-ray-levers) | [#3](https://github.com/TSunny007/skypilot/pull/3) | C: faster Ray bring-up; a stdlib-only per-node task; bundle IPs and live node count from the GCS | master |
+| [`ll/5-post-ready-chain`](https://github.com/TSunny007/skypilot/tree/ll/5-post-ready-chain) | [#4](https://github.com/TSunny007/skypilot/pull/4) | D: skylet starts under the Ray wait; deps-only install at pod start instead of PyPI SkyPilot | `ll/4-ray-levers` |
+| [`ll/6-fast-start`](https://github.com/TSunny007/skypilot/tree/ll/6-fast-start) | [#6](https://github.com/TSunny007/skypilot/pull/6) | B: opt-in self-starting pods for managed jobs (`kubernetes.fast_start`) | `ll/4-ray-levers` |
+
+## How to reproduce
+```bash
+git checkout ll/consolidated && uv pip install -e ".[kubernetes]"   # and a Kind cluster: sky local up
+sky api stop; sky api start --deploy
+printf 'kubernetes:\n  fast_start: true\n' > ~/.sky/config.yaml   # back up any existing config first
+bash bench/bench.sh sfw0; bash bench/bench.sh sf1; bash bench/bench.sh sf2   # warm-up + 2 trials
+python bench/summarize.py bench/runs/sfw0 bench/runs/sf1 bench/runs/sf2 && python bench/compare.py sf=sf1,sf2
+```
+
+## Please dig in
+Check out the branches and read the open PRs: their descriptions carry more color than this page. They cover the design decisions and the alternatives we rejected, what was and wasn't measured, test plans with expected output, and known risks and open bugs. If something looks off, the team logs in `bench/teams/` usually explain why it was done that way.
+
+---
+
 <p align="center">
   <a href="https://skypilot.ai/">
     <picture>
