@@ -1,19 +1,28 @@
 """Verda Cloud (formerly DataCrunch) instance provisioning."""
 
 import time
+import typing
 from typing import Any, Dict, List, Optional, Tuple
 
 from sky import exceptions
 from sky import sky_logging
+from sky.adaptors import common as adaptors_common
 from sky.adaptors.verda import Instance
 from sky.adaptors.verda import InstanceStatus
 from sky.adaptors.verda import VerdaClient
 from sky.clouds.verda import VERDA_DEFAULT_IMAGE
 from sky.provision import common
-from sky.resources import DEFAULT_DISK_SIZE_GB
 from sky.utils import common_utils
 from sky.utils import status_lib
 from sky.utils import ux_utils
+
+if typing.TYPE_CHECKING:
+    import sky.resources as _resources
+else:
+    # Lazy: sky.resources imports sky.clouds, whose cloud modules import
+    # sky.provision (and hence this module), so a top-level import is
+    # circular. Only DEFAULT_DISK_SIZE_GB is used, at runtime.
+    _resources = adaptors_common.LazyImport('sky.resources')
 
 # The maximum number of times to poll for the status of an operation.
 POLL_INTERVAL = 5
@@ -131,7 +140,8 @@ def run_instances(
             # Extract vCPUs and memory from instance type
             # Format: instance_type__vcpus__memory[__SPOT]
             instance_type = config.node_config['InstanceType']
-            disk_size = config.node_config.get('DiskSize', DEFAULT_DISK_SIZE_GB)
+            disk_size = config.node_config.get('DiskSize',
+                                               _resources.DEFAULT_DISK_SIZE_GB)
             # Preemptible - fancy way to call it a spot instance
             is_spot = config.node_config.get('Preemptible', None)
 

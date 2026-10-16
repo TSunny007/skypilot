@@ -13,7 +13,6 @@ import filelock
 
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
-from sky.clouds import cloud as cloud_lib
 from sky.skylet import constants
 from sky.skylet import runtime_utils
 from sky.utils import annotations
@@ -26,9 +25,14 @@ from sky.utils import ux_utils
 if typing.TYPE_CHECKING:
     import pandas as pd
     import requests
+
+    from sky.clouds import cloud as cloud_lib
 else:
     pd = adaptors_common.LazyImport('pandas')
     requests = adaptors_common.LazyImport('requests')
+    # Lazy: sky.clouds imports every cloud module, and some of those (via
+    # sky.provision) import this module, so a top-level import is circular.
+    cloud_lib = adaptors_common.LazyImport('sky.clouds.cloud')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -869,7 +873,7 @@ def list_accelerators_impl(
 
 
 def get_region_zones(df: 'pd.DataFrame',
-                     use_spot: bool) -> List[cloud_lib.Region]:
+                     use_spot: bool) -> List['cloud_lib.Region']:
     """Returns a list of regions/zones from a dataframe."""
     price_str = 'SpotPrice' if use_spot else 'Price'
     sort_keys = [price_str, 'Region']
