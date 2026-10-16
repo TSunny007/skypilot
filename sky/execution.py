@@ -3,11 +3,15 @@
 See `Stage` for a Task's life cycle.
 """
 import asyncio
+import concurrent.futures
 import contextlib
+import contextvars
 import enum
+import functools
 import logging
 import os
 import tempfile
+import threading
 import time
 import typing
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
@@ -393,6 +397,27 @@ def _execute(
             job_logger=job_logger)
 
 
+def _start_in_thread(func: Callable[[], None]) -> 'concurrent.futures.Future':
+    """Run func in a new thread, with the caller's contextvars.
+
+    The copied context carries the request's SkyPilotContext, so output and
+    logs go where the caller's go.
+    """
+    future: concurrent.futures.Future = concurrent.futures.Future()
+    ctx = contextvars.copy_context()
+
+    def run() -> None:
+        try:
+            ctx.run(func)
+        except BaseException as e:  # pylint: disable=broad-except
+            future.set_exception(e)
+        else:
+            future.set_result(None)
+
+    threading.Thread(target=run, name='set-autostop', daemon=True).start()
+    return future
+
+
 def _autodown_needs_identity_it_lacks(
         handle: Optional[backends.ResourceHandle]) -> bool:
     """Whether the cluster's pods have no credentials to autodown with."""
@@ -682,6 +707,9 @@ def _execute_dag(
                         global_user_state.ClusterEventType.STATUS_CHANGE)
                 backend.setup(handle, task, detach_setup=detach_setup)
 
+        # The jobs controller's autodown leak guard, when it is being set
+        # alongside EXEC (see below).
+        leak_guard: Optional[concurrent.futures.Future] = None
         if Stage.PRE_EXEC in stages and not dryrun:
             task_hooks = resources[0].hooks
             # Hooks payload sent to skylet:
@@ -719,13 +747,24 @@ def _execute_dag(
             if idle_minutes_to_autostop is not None:
                 assert isinstance(backend, backends.CloudVmRayBackend)
                 assert isinstance(handle, backends.CloudVmRayResourceHandle)
-                backend.set_autostop(handle,
-                                     idle_minutes_to_autostop,
-                                     wait_for,
-                                     down,
-                                     hook=hook,
-                                     hook_timeout=hook_timeout,
-                                     hooks=hooks_payload)
+                set_autostop = functools.partial(backend.set_autostop,
+                                                 handle,
+                                                 idle_minutes_to_autostop,
+                                                 wait_for,
+                                                 down,
+                                                 hook=hook,
+                                                 hook_timeout=hook_timeout,
+                                                 hooks=hooks_payload)
+                if _is_launched_by_jobs_controller and Stage.EXEC in stages:
+                    # The jobs controller's leak guard (autodown in case the
+                    # controller dies) is not needed to queue the job, and
+                    # setting it is a head round trip (~2.7 s over `kubectl
+                    # exec`). Set it alongside EXEC rather than before it;
+                    # it is joined below, so the launch still returns only
+                    # once the guard is set, and fails if setting it fails.
+                    leak_guard = _start_in_thread(set_autostop)
+                else:
+                    set_autostop()
             elif hooks_payload is not None:
                 # Hooks can fire on preemption/down independent of
                 # autostop — persist them even when autostop is disabled.
@@ -745,6 +784,12 @@ def _execute_dag(
             finally:
                 # Enables post_execute() to be run after KeyboardInterrupt.
                 backend.post_execute(handle, down)
+                if leak_guard is not None:
+                    # Even if EXEC failed: never leave it in flight.
+                    concurrent.futures.wait([leak_guard])
+        if leak_guard is not None:
+            # Raises what setting it raised, as when it ran before EXEC.
+            leak_guard.result()
 
         if Stage.DOWN in stages and not dryrun:
             if down and idle_minutes_to_autostop is None:

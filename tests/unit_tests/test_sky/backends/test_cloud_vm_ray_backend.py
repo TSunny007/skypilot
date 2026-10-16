@@ -1,6 +1,9 @@
 """Unit tests for CloudVmRayBackend task configuration redaction and locking."""
 
+import contextlib
+import io
 import multiprocessing
+import shlex
 import socket
 import time
 import types
@@ -18,9 +21,13 @@ from sky.backends import cloud_vm_ray_backend
 from sky.backends.cloud_vm_ray_backend import CloudVmRayResourceHandle
 from sky.backends.cloud_vm_ray_backend import SSHTunnelInfo
 from sky.provision import common as provision_common
+from sky.schemas.generated import jobsv1_pb2
 from sky.skylet import constants as skylet_constants
+from sky.skylet import job_lib
 from sky.utils import locks
+from sky.utils import message_utils
 from sky.utils import status_lib
+from sky.utils.db import db_utils
 
 
 def test_command_length_local_shell_limit():
@@ -1047,3 +1054,117 @@ class TestProvisionExistingClusterError:
                 self._provision(status_lib.ClusterStatus.INIT, **error)
         optimize.assert_called_once()
         assert not e.value.no_failover
+
+
+class TestGetJobStatusWithEndTime:
+    """The job-status read that folds a terminal job's end time into the same
+    head round trip, saving the controller's separate end-time query."""
+
+    @pytest.fixture
+    def jobs_db(self, tmp_path, monkeypatch):
+        """A real head-side job table: one SUCCEEDED job, then a RUNNING one."""
+        monkeypatch.setattr(job_lib, '_JOB_STATUS_LOCK',
+                            str(tmp_path / 'locks' / '.job_{}.lock'))
+        monkeypatch.setattr(
+            job_lib, '_DB',
+            db_utils.SQLiteConn(str(tmp_path / 'jobs.db'),
+                                job_lib.create_table))
+        succeeded, _ = job_lib.add_job('a', 'user', 'sky-1', '1x[CPU:1]')
+        job_lib.set_status(succeeded, job_lib.JobStatus.SUCCEEDED)
+        running, _ = job_lib.add_job('b', 'user', 'sky-2', '1x[CPU:1]')
+        job_lib.set_job_started(running)
+        end_at = job_lib.get_job_submitted_or_ended_timestamp(succeeded, True)
+        assert end_at is not None
+        return succeeded, running, end_at
+
+    @staticmethod
+    def _run_on_head(code: str) -> str:
+        """Run a generated snippet the way the head runs it; return stdout."""
+        inner = shlex.split(code)[-1]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exec(compile(inner, '<codegen>', 'exec'), {})  # pylint: disable=exec-used
+        return out.getvalue()
+
+    @staticmethod
+    def _backend(stdout, grpc=False):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend.__new__(
+            cloud_vm_ray_backend.CloudVmRayBackend)
+        handle = MagicMock()
+        handle.is_grpc_enabled_with_flag = grpc
+        backend.run_on_head = MagicMock(return_value=(0, stdout, ''))
+        return backend, handle
+
+    def _status_with_end_time(self, job_id):
+        code = job_lib.JobLibCodeGen.get_job_status_with_end_time(
+            None if job_id is None else [job_id])
+        stdout = self._run_on_head(code)
+        # The new snippet prints exactly what get_job_status prints, first.
+        assert stdout.startswith(
+            self._run_on_head(
+                job_lib.JobLibCodeGen.get_job_status(
+                    None if job_id is None else [job_id])))
+        backend, handle = self._backend(stdout)
+        return backend.get_job_status_with_end_time(handle, job_id)
+
+    def test_terminal_job_folds_end_time(self, jobs_db):
+        succeeded, _, end_at = jobs_db
+        assert self._status_with_end_time(succeeded) == (
+            job_lib.JobStatus.SUCCEEDED, end_at)
+
+    def test_running_job_has_no_end_time(self, jobs_db):
+        _, running, _ = jobs_db
+        assert self._status_with_end_time(running) == (
+            job_lib.JobStatus.RUNNING, None)
+
+    def test_latest_job_when_no_job_id(self, jobs_db):
+        # Non-pool managed jobs query the cluster's latest job (job_id=None).
+        assert self._status_with_end_time(None) == (job_lib.JobStatus.RUNNING,
+                                                    None)
+        job_lib.set_status(jobs_db[1], job_lib.JobStatus.FAILED)
+        status, end_time = self._status_with_end_time(None)
+        assert status == job_lib.JobStatus.FAILED
+        assert end_time == job_lib.get_job_submitted_or_ended_timestamp(
+            jobs_db[1], True)
+
+    def test_unknown_job(self, jobs_db):
+        del jobs_db
+        assert self._status_with_end_time(99) == (None, None)
+
+    def test_end_time_read_failure_still_returns_status(self, jobs_db,
+                                                        monkeypatch):
+        # Everything after the statuses line is best-effort head-side (e.g. a
+        # head running an older SkyPilot): a failure there must not cost the
+        # status, which the controller cannot do without.
+        def boom(*args, **kwargs):
+            raise AttributeError('old runtime')
+
+        monkeypatch.setattr(job_lib,
+                            'get_job_submitted_or_ended_timestamp_payload',
+                            boom)
+        assert self._status_with_end_time(
+            jobs_db[0]) == (job_lib.JobStatus.SUCCEEDED, None)
+
+    def test_statuses_only_output_parses(self):
+        # Output with only the statuses payload (as the plain get_job_status
+        # codegen prints) parses with no end time.
+        stdout = message_utils.encode_payload({3: 'SUCCEEDED'}) + '\n'
+        backend, handle = self._backend(stdout)
+        assert backend.get_job_status_with_end_time(
+            handle, 3) == (job_lib.JobStatus.SUCCEEDED, None)
+
+    def test_empty_stdout_is_a_failure(self):
+        backend, handle = self._backend('')
+        with pytest.raises(exceptions.CommandFailureException):
+            backend.get_job_status_with_end_time(handle, 3)
+
+    def test_grpc_returns_status_without_end_time(self, monkeypatch):
+        # The end time stays a separate (cheap) RPC on gRPC handles.
+        response = MagicMock(job_statuses={3: jobsv1_pb2.JOB_STATUS_SUCCEEDED})
+        monkeypatch.setattr(cloud_vm_ray_backend.backend_utils,
+                            'invoke_skylet_with_retries',
+                            MagicMock(return_value=response))
+        backend, handle = self._backend('', grpc=True)
+        assert backend.get_job_status_with_end_time(
+            handle, 3) == (job_lib.JobStatus.SUCCEEDED, None)
+        backend.run_on_head.assert_not_called()

@@ -10,6 +10,7 @@ import pytest
 
 from sky.clouds import kubernetes
 from sky.clouds.utils import gcp_utils
+from sky.provision import instance_setup
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.utils import resources_utils
 
@@ -1291,6 +1292,14 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertIn('apply_patches.py', deploy_vars['ray_patches_cmd'])
         self.assertNotIn('from sky.skylet.ray_patches',
                          deploy_vars['ray_patches_cmd'])
+
+        # The pod's head Ray start does not end in the `ray status` wait
+        # loop: on Kubernetes it gates nothing and only burns head CPU.
+        self.assertIn('start --head', deploy_vars['ray_head_start_command'])
+        self.assertIn(instance_setup.DUMP_RAY_PORTS,
+                      deploy_vars['ray_head_start_command'])
+        self.assertNotIn(instance_setup.RAY_HEAD_WAIT_INITIALIZED_COMMAND,
+                         deploy_vars['ray_head_start_command'])
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
     @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'

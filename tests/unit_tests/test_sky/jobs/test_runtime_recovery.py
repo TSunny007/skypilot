@@ -15,6 +15,20 @@ from sky.provision import observation as provision_observation
 from sky.skylet import job_lib
 
 
+@pytest.fixture(autouse=True)
+def _monitor_reads_status_via_get_job_status(monkeypatch):
+    """Route the monitor's status read through get_job_status, which the
+    tests here stub (see the same fixture in test_controller.py)."""
+
+    async def via_get_job_status(*args, **kwargs):
+        status, reason = await (
+            controller_module.managed_job_utils.get_job_status(*args, **kwargs))
+        return status, None, reason
+
+    monkeypatch.setattr(controller_module.managed_job_utils,
+                        'get_job_status_and_end_time', via_get_job_status)
+
+
 @pytest.fixture
 def database(tmp_path, monkeypatch):
     path = tmp_path / 'jobs.db'

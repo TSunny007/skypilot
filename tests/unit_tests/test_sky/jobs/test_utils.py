@@ -6,10 +6,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from sky import backends
 from sky import exceptions
+from sky import global_user_state
 from sky.jobs import constants as managed_job_constants
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as jobs_utils
+from sky.skylet import job_lib
 
 
 class TestClusterHandleNotRequired:
@@ -2311,3 +2314,81 @@ class TestFormatJobTableDynamicMembers:
                                             show_user=False,
                                             return_rows=True)
         assert self._id_task_status(table) == [('70', '-', 'RUNNING')]
+
+
+class TestGetJobStatusAndEndTime:
+    """The monitor's status read, which folds in a terminal job's end time."""
+
+    @pytest.fixture(autouse=True)
+    def _handle(self, monkeypatch):
+        handle = MagicMock(spec=backends.CloudVmRayResourceHandle)
+        monkeypatch.setattr(global_user_state, 'get_handle_from_cluster_name',
+                            lambda _: handle)
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            lambda: False)
+        return handle
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('job_id', [3, None])
+    async def test_folds_end_time_from_status_read(self, job_id):
+        # job_id None is the non-pool case: the cluster's latest job.
+        backend = MagicMock()
+        backend.get_job_status_with_end_time.return_value = (
+            job_lib.JobStatus.SUCCEEDED, 1234.5)
+
+        assert await jobs_utils.get_job_status_and_end_time(
+            backend, 'cluster',
+            job_id) == (job_lib.JobStatus.SUCCEEDED, 1234.5, None)
+        assert backend.get_job_status_with_end_time.call_args.args[1] == job_id
+        backend.get_job_status.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_end_time_none_when_not_folded(self):
+        backend = MagicMock()
+        backend.get_job_status_with_end_time.return_value = (
+            job_lib.JobStatus.RUNNING, None)
+
+        assert await jobs_utils.get_job_status_and_end_time(
+            backend, 'cluster', 3) == (job_lib.JobStatus.RUNNING, None, None)
+
+    @pytest.mark.asyncio
+    async def test_runtime_plugin_keeps_its_own_end_time(self, monkeypatch):
+        # A registered runtime owns the end time (try_to_get_job_end_time asks
+        # it first), so even when it defers the status to the cluster the
+        # read must not fold in the cluster's end time.
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            lambda: True)
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'get_job_status',
+                            lambda *_: None)
+        backend = MagicMock()
+        backend.get_job_status.return_value = {3: job_lib.JobStatus.SUCCEEDED}
+
+        assert await jobs_utils.get_job_status_and_end_time(
+            backend, 'cluster', 3) == (job_lib.JobStatus.SUCCEEDED, None, None)
+        backend.get_job_status_with_end_time.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_plain_get_job_status_unchanged(self):
+        """The original two-tuple contract of get_job_status is kept."""
+        backend = MagicMock()
+        backend.get_job_status.return_value = {3: job_lib.JobStatus.RUNNING}
+
+        assert await jobs_utils.get_job_status(backend, 'cluster',
+                                               3) == (job_lib.JobStatus.RUNNING,
+                                                      None)
+        backend.get_job_status_with_end_time.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_transient_error_returns_reason_and_no_end_time(self):
+        backend = MagicMock()
+        backend.get_job_status_with_end_time.side_effect = (
+            exceptions.CommandError(returncode=255,
+                                    command='status',
+                                    error_msg='ssh gone',
+                                    detailed_reason='ssh gone'))
+
+        status, end_time, reason = await jobs_utils.get_job_status_and_end_time(
+            backend, 'cluster', 3)
+        assert status is None
+        assert end_time is None
+        assert reason is not None and '255' in reason

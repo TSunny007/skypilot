@@ -2,6 +2,7 @@
 import copy
 import dataclasses
 import enum
+import functools
 import json
 import math
 import os
@@ -54,6 +55,7 @@ from sky.provision import instance_setup
 from sky.provision import metadata_utils
 from sky.provision import provisioner
 from sky.provision.kubernetes import config as config_lib
+from sky.provision.kubernetes import fast_start as k8s_fast_start
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.slurm import utils as slurm_utils
 from sky.serve import constants as serve_constants
@@ -3264,6 +3266,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._is_managed = False
         self._extra_launch_context: Dict[str, Any] = {}
         self._is_launched_by_jobs_controller = False
+        # This launch's push-based self-start, if any (kubernetes.fast_start).
+        self._fast_start_launch: Optional[k8s_fast_start.PendingLaunch] = None
         # Optional planner (via register_info): used under the per-cluster lock
         # to produce a fresh concrete plan when neither a reusable snapshot nor
         # a caller plan is available.
@@ -3416,6 +3420,296 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                                 for k, v in valid_resource.accelerators.items()
                             })
         return valid_resource
+
+    def _maybe_prepare_fast_start(
+            self, task: task_lib.Task,
+            to_provision_config: 'RetryingVmProvisioner.ToProvisionConfig',
+            wheel_hash: str) -> None:
+        """Sets up push-based self-start (kubernetes.fast_start) if eligible.
+
+        When eligible, the job the host would normally push to the head after
+        provisioning (add_job, driver upload, queue) is rendered into the pod
+        spec instead: the provisioner registry's template_override hook
+        renders it for each provisioning attempt (_render_fast_start_spec)
+        and activates the gated section of kubernetes-ray.yml.j2, and
+        bootstrap_instances() places it into a ConfigMap/Secret the pods
+        mount. The pods then register and start the job themselves (see
+        sky/provision/kubernetes/fast_start.py).
+        """
+        # The dict may be the caller's; keep this launch's key out of it.
+        self._extra_launch_context = dict(self._extra_launch_context)
+        self._extra_launch_context.pop(k8s_fast_start.LAUNCH_CONTEXT_KEY, None)
+        self._fast_start_launch = None
+        to_provision = to_provision_config.resources
+        num_nodes = to_provision_config.num_nodes
+        cluster_name = to_provision_config.cluster_name
+        reason = k8s_fast_start.launch_ineligibility_reason(
+            task,
+            num_nodes,
+            cluster_exists=to_provision_config.prev_cluster_status is not None,
+            is_launched_by_jobs_controller=self._is_launched_by_jobs_controller)
+        if reason is None:
+            reason = k8s_fast_start.resources_ineligibility_reason(to_provision)
+        if reason is None:
+            registered = provision_lib.get_registered_provisioner('kubernetes')
+            if (registered is not None and registered.template_override
+                    is not k8s_fast_start.template_override):
+                reason = 'another provisioner is registered for kubernetes'
+        if reason is not None:
+            logger.debug(f'fast_start not used: {reason}.')
+            return
+        assert to_provision.cloud is not None  # Checked above.
+        cluster_name_on_cloud = common_utils.make_cluster_name_on_cloud(
+            cluster_name,
+            max_length=to_provision.cloud.max_cluster_name_length())
+        timeout = k8s_fast_start.resolve_timeout()
+
+        # Registration is process-global and idempotent (nothing else is
+        # registered for kubernetes, checked above). It cannot live in
+        # fast_start.py's import: that module is imported by
+        # sky.provision.kubernetes.config while sky.provision is itself still
+        # initializing. The hook acts only on launches that carry the launch
+        # context key below.
+        provision_lib.register_provisioner(
+            'kubernetes',
+            module=None,
+            template_override=k8s_fast_start.template_override)
+        # The backend holds the only strong reference: the stash entry lives
+        # exactly as long as this launch.
+        self._fast_start_launch = k8s_fast_start.PendingLaunch(
+            functools.partial(self._render_fast_start_spec, task, num_nodes,
+                              cluster_name, cluster_name_on_cloud, wheel_hash,
+                              timeout))
+        k8s_fast_start.stash_launch(cluster_name_on_cloud,
+                                    self._fast_start_launch)
+        self._extra_launch_context[k8s_fast_start.LAUNCH_CONTEXT_KEY] = {
+            'cluster_name_on_cloud': cluster_name_on_cloud,
+            'job_id': 1,
+            'timeout': timeout,
+        }
+
+    def _render_fast_start_spec(
+        self, task: task_lib.Task, num_nodes: int, cluster_name: str,
+        cluster_name_on_cloud: str, wheel_hash: str, timeout: int,
+        to_provision: resources_lib.Resources
+    ) -> Optional[k8s_fast_start.FastStartSpec]:
+        """Renders the pod-side job for one provisioning attempt.
+
+        Returns None if this attempt's resources must take the regular path.
+        The rendering mirrors _execute_task_n_nodes, _setup (detach_setup) and
+        _exec_code_on_head; anything the host only learns after provisioning
+        (the pod IPs) is left as placeholders the pods substitute
+        (k8s_fast_start.driver_ip_placeholders).
+        """
+        reason = k8s_fast_start.resources_ineligibility_reason(to_provision)
+        if reason is not None:
+            logger.debug(f'fast_start not used for this attempt: {reason}.')
+            return None
+        assert to_provision.cloud is not None  # Checked above.
+
+        # A fresh cluster's jobs table is empty and job_lib.add_job
+        # autoincrements, so the first job is id 1. The pod-side submit
+        # script asserts this and fails the launch otherwise.
+        job_id = 1
+        job_name = task.name if task.name is not None else '-'
+        # Matches job_lib.add_job: the job's log dir on the head.
+        remote_log_dir = os.path.join(constants.SKY_LOGS_DIRECTORY,
+                                      f'{job_id}-{job_name}')
+        log_dir = os.path.join(remote_log_dir, 'tasks')
+
+        # Same recipe as _execute: the resource string describes the one
+        # resource being launched.
+        task_copy = copy.copy(task)
+        task_copy.set_resources(to_provision.assert_launchable())
+        task_copy.best_resources = None
+        resources_str = backend_utils.get_task_resources_str(task_copy)
+
+        # Same content as _skypilot_predefined_env_vars(handle): the handle
+        # does not exist yet, but everything it reads is known now (a
+        # Kubernetes cluster's zone is always None).
+        predefined_env_vars = {
+            'SKYPILOT_CLUSTER_INFO': json.dumps({
+                'cluster_name': cluster_name,
+                'cloud': str(to_provision.cloud),
+                'region': to_provision.region,
+                'zone': None,
+            }),
+            constants.USER_ENV_VAR: common_utils.get_current_user_name(),
+        }
+        # Same as _get_task_env_vars.
+        task_env_vars = task_lib.get_plaintext_envs_and_secrets(
+            task.envs_and_secrets)
+        # If it is a managed job, the TASK_ID_ENV_VAR will have been already
+        # set by the controller.
+        if constants.TASK_ID_ENV_VAR not in task_env_vars:
+            task_env_vars[constants.TASK_ID_ENV_VAR] = (
+                common_utils.get_global_job_id(self.run_timestamp,
+                                               cluster_name=cluster_name,
+                                               job_id=str(job_id)))
+        task_env_vars.update(predefined_env_vars)
+
+        # Same as _setup with detach_setup=True, except the script body mark
+        # stands in for the user's setup: the per-node exports
+        # (SKYPILOT_SETUP_NODE_IPS/RANK/NUM_GPUS_PER_NODE) differ per pod, so
+        # each pod writes its own copy between the prefix and the body.
+        setup_cmd = None
+        setup_path = None
+        setup_parts = None
+        if task.setup is not None:
+            setup_path = f'/tmp/sky_setup_{self.run_timestamp}'
+            setup_cmd = f'/bin/bash -i {setup_path} 2>&1'
+            unset_ray_env_vars = ' && '.join(
+                [f'unset {var}' for var in task_codegen.UNSET_RAY_ENV_VARS])
+            # Each pod writes its own setup script; wait for it (bounded).
+            wait_for_script = (
+                k8s_fast_start.wait_for_setup_script_command(setup_path))
+            setup_cmd = f'{unset_ray_env_vars}; {wait_for_script}; {setup_cmd}'
+            setup_envs = task_lib.get_plaintext_envs_and_secrets(
+                task.envs_and_secrets)
+            setup_envs.update(predefined_env_vars)
+            setup_parts = k8s_fast_start.split_setup_script(
+                log_lib.make_task_bash_script(k8s_fast_start.SETUP_BODY_MARK,
+                                              env_vars=setup_envs), task.setup)
+
+        codegen = task_codegen.RayCodeGen()
+        codegen.add_prologue(job_id)
+        codegen.add_setup(
+            num_nodes,
+            backend_utils.get_task_demands_dict(task_copy),
+            stable_cluster_internal_ips=(
+                k8s_fast_start.driver_ip_placeholders(num_nodes)),
+            env_vars=task_env_vars,
+            log_dir=log_dir,
+            setup_cmd=setup_cmd,
+        )
+        codegen.add_task(
+            num_nodes,
+            bash_script=task.run,
+            env_vars=task_env_vars,
+            task_name=task.name,
+            resources_dict=backend_utils.get_task_demands_dict(task_copy),
+            log_dir=log_dir)
+        codegen.add_epilogue()
+        driver = codegen.build()
+
+        # Same as the command the queued driver process runs
+        # (_exec_code_on_head), minus the mkdir/upload steps the head's
+        # fast_start.sh performs itself.
+        script_path = os.path.join(SKY_REMOTE_APP_DIR, f'sky_job_{job_id}')
+        remote_log_path = os.path.join(remote_log_dir, 'run.log')
+        job_submit_cmd = (f'{job_lib.JOB_CMD_IDENTIFIER.format(job_id)} && '
+                          f'{constants.SKY_PYTHON_CMD} -u {script_path}'
+                          f'> {remote_log_path} 2>&1')
+
+        # The head holds the job until the host has synced workdir/file
+        # mounts; execution.py runs those stages before execute(). Empty
+        # mounts are a no-op sync, so they must not hold the job.
+        wait_release = (task.workdir is not None or bool(task.file_mounts) or
+                        bool(task.storage_mounts))
+        manifest = k8s_fast_start.render_manifest(
+            num_nodes=num_nodes,
+            cluster_name_on_cloud=cluster_name_on_cloud,
+            job_id=job_id,
+            job_name=job_name,
+            username=common_utils.get_user_hash(),
+            run_timestamp=self.run_timestamp,
+            resources_str=resources_str,
+            metadata=task.metadata_json,
+            wheel_hash=wheel_hash,
+            remote_log_dir=remote_log_dir,
+            driver_path=script_path,
+            num_gpus=self._get_num_gpus(task),
+            setup_path=setup_path,
+            wait_release=wait_release,
+            timeout=timeout)
+        spec = k8s_fast_start.build_spec(
+            cluster_name_on_cloud=cluster_name_on_cloud,
+            num_nodes=num_nodes,
+            job_id=job_id,
+            driver=driver,
+            job_submit_cmd=job_submit_cmd,
+            manifest=manifest,
+            setup_parts=setup_parts,
+            has_secrets=bool(task.secrets),
+            wait_release=wait_release,
+            timeout=timeout)
+        if spec.total_bytes() > k8s_fast_start.MAX_OBJECT_BYTES:
+            logger.warning(
+                'fast_start not used: the rendered job is '
+                f'{spec.total_bytes()} bytes, over the '
+                f'{k8s_fast_start.MAX_OBJECT_BYTES} bytes a ConfigMap '
+                'comfortably holds. Taking the regular launch path.')
+            return None
+        logger.info('fast_start: the pods will register and start the job '
+                    'themselves (kubernetes.fast_start).')
+        return spec
+
+    def _fast_start_launch_active(self,
+                                  handle: CloudVmRayResourceHandle) -> bool:
+        """Whether this launch's new pods start the job themselves."""
+        return (k8s_fast_start.LAUNCH_CONTEXT_KEY in self._extra_launch_context
+                and handle.provision_runtime_metadata.run_started and
+                self._is_fast_start_cluster(handle))
+
+    def _is_fast_start_cluster(self, handle: CloudVmRayResourceHandle) -> bool:
+        """Whether the cluster's pods were rendered with fast_start."""
+        if handle.cluster_yaml is None:
+            return False
+        provider_config = global_user_state.get_cluster_yaml_dict(
+            handle.cluster_yaml).get('provider') or {}
+        return bool(provider_config.get('fast_start'))
+
+    def _release_fast_start_job(self, handle: CloudVmRayResourceHandle) -> None:
+        """Lets the head pod queue the job: the host's file syncs are done.
+
+        execution.py syncs the workdir and file mounts before setup(), which
+        calls this; execute() calls it again (idempotent) for launches that
+        skip the setup stage.
+        """
+        release_cmd = k8s_fast_start.release_command()
+        returncode = self.run_on_head(handle, release_cmd, stream_logs=False)
+        subprocess_utils.handle_returncode(
+            returncode, release_cmd,
+            'fast_start: failed to release the job on the head pod.')
+
+    def _await_fast_start_gang(self, handle: CloudVmRayResourceHandle) -> int:
+        """Replaces the add-job/upload/queue execs for fast_start launches.
+
+        Releases the head (if setup() has not), then watches its state file
+        until every node has joined the job's placement group (GANG) or the
+        pod-side bootstrap reports FAILED, which fails the launch so the
+        existing retry/teardown path applies.
+
+        Returns:
+            The job id the head registered.
+        """
+        self._release_fast_start_job(handle)
+
+        def _read_state() -> str:
+            returncode, stdout, _ = self.run_on_head(
+                handle,
+                k8s_fast_start.read_state_command(),
+                stream_logs=False,
+                require_outputs=True)
+            if returncode:
+                # The head pod is gone or the API flaked; fail the launch so
+                # the existing retry/teardown path applies.
+                raise RuntimeError(
+                    'fast_start: could not read the head pod\'s state; the '
+                    'pod may have failed during bootstrap.')
+            return stdout
+
+        context = self._extra_launch_context[k8s_fast_start.LAUNCH_CONTEXT_KEY]
+        # The head restarts its deadline after the release, so budget two
+        # in-pod timeouts as a backstop.
+        with rich_utils.safe_status(
+                ux_utils.spinner_message(
+                    'Waiting for all nodes to join the job')):
+            k8s_fast_start.wait_for_gang(_read_state,
+                                         timeout=2 * int(context['timeout']))
+        job_id = int(context['job_id'])
+        logger.info(ux_utils.starting_message(f'Job submitted, ID: {job_id}'))
+        return job_id
 
     def _provision(
         self,
@@ -3604,6 +3898,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 # TODO(suquark): once we have sky on PyPI, we should directly
                 # install sky from PyPI.
                 local_wheel_path, wheel_hash = wheel_utils.build_sky_wheel()
+            # Push-based self-start (kubernetes.fast_start): render the job
+            # into the pod spec now, so the pods can register and start it
+            # themselves. No-op unless this launch is eligible.
+            self._maybe_prepare_fast_start(task, to_provision_config,
+                                           wheel_hash)
             while True:
                 # For on-demand instances, RetryingVmProvisioner will retry
                 # within the given region first, then optionally retry on all
@@ -4140,6 +4439,14 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                detach_setup: bool) -> None:
 
         start = time.time()
+
+        if self._fast_start_launch_active(handle):
+            # Each pod wrote its own setup script and the driver runs setup,
+            # as with detach_setup. The file syncs that precede this stage are
+            # done, so let the head queue the job now.
+            self._release_fast_start_job(handle)
+            logger.info(ux_utils.finishing_message('Setup detached.'))
+            return
 
         if handle.provision_runtime_metadata.setup_done:
             logger.info('Skipping setup: provisioner reported done.')
@@ -4685,7 +4992,16 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         Returns:
             Job id if the task is submitted to the cluster, None otherwise.
         """
-        if handle.provision_runtime_metadata.run_started:
+        if self._fast_start_launch_active(handle):
+            # The pods register and start the job themselves; the host only
+            # waits for the gang to form.
+            if dryrun:
+                return None
+            return self._await_fast_start_gang(handle)
+        if (handle.provision_runtime_metadata.run_started and
+                not self._is_fast_start_cluster(handle)):
+            # A fast_start cluster runs the regular Ray/skylet job queue, so a
+            # later job on it (e.g. `sky exec`) takes the regular path below.
             logger.info('Skipping run: provisioner reported run already '
                         'started.')
             return None
@@ -4927,6 +5243,54 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             )
         statuses = job_lib.load_statuses_payload(stdout)
         return statuses
+
+    def get_job_status_with_end_time(
+        self,
+        handle: CloudVmRayResourceHandle,
+        job_id: Optional[int],
+        stream_logs: bool = False,
+    ) -> Tuple[Optional[job_lib.JobStatus], Optional[float]]:
+        """The status of one job (the latest if None), plus its end time.
+
+        On the SSH/codegen path the end time of a terminal job comes back in
+        the same head round trip as the status, which saves the jobs
+        controller the separate end-time query it otherwise makes once the
+        job finishes. The end time is None when the job is not terminal, the
+        head runs an older SkyPilot, or on gRPC, where the separate end-time
+        RPC is cheap and stays as it is.
+        """
+        job_ids = None if job_id is None else [job_id]
+        if handle.is_grpc_enabled_with_flag:
+            statuses = self.get_job_status(handle,
+                                           job_ids,
+                                           stream_logs=stream_logs)
+            return list(statuses.values())[0], None
+
+        code = job_lib.JobLibCodeGen.get_job_status_with_end_time(job_ids)
+        returncode, stdout, stderr = self.run_on_head(handle,
+                                                      code,
+                                                      stream_logs=stream_logs,
+                                                      require_outputs=True,
+                                                      separate_stderr=True)
+        subprocess_utils.handle_returncode(returncode, code,
+                                           'Failed to get job status.', stderr)
+        if not stdout:
+            # Same guard as get_job_status: a misbehaving cluster/k8s
+            # apiserver can return 0 with an empty stdout.
+            raise exceptions.CommandFailureException(
+                command=code,
+                failure='produced no output',
+                error_msg='Failed to get job status.',
+                detailed_reason=f'stderr="{stderr}"',
+            )
+        # The untyped decode returns the first payload in the output, which
+        # is the statuses payload; the end time is picked out by its type.
+        statuses = job_lib.load_statuses_payload(stdout)
+        matched, end_time = message_utils.decode_payload(
+            stdout, payload_type='job-end-time', raise_for_mismatch=False)
+        if not matched or end_time is None:
+            return list(statuses.values())[0], None
+        return list(statuses.values())[0], float(end_time)
 
     def get_job_metadata(
         self,

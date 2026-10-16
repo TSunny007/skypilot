@@ -6,13 +6,103 @@ import importlib.util
 import os
 import subprocess
 import sys
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import urllib.request
 
 from sky.utils import directory_utils
 
 if TYPE_CHECKING:
     from importlib.metadata import EntryPoint
+
+    # The public API. At runtime these names are imported lazily, on first
+    # access, by the module ``__getattr__`` below; the imports here are for
+    # type checkers and IDEs only. Keep them in sync with _LAZY_ATTRIBUTES.
+    # pylint: disable=unused-import,ungrouped-imports
+    from sky import backends
+    from sky import batch  # noqa: F401
+    from sky import clouds
+    from sky.admin_policy import AdminPolicy
+    from sky.admin_policy import MutatedUserRequest
+    from sky.admin_policy import UserRequest
+    from sky.catalog import list_accelerators
+    from sky.client.sdk import api_cancel
+    from sky.client.sdk import api_info
+    from sky.client.sdk import api_login
+    from sky.client.sdk import api_server_logs
+    from sky.client.sdk import api_start
+    from sky.client.sdk import api_status
+    from sky.client.sdk import api_stop
+    from sky.client.sdk import autostop
+    from sky.client.sdk import cancel
+    from sky.client.sdk import cluster_job_spec
+    from sky.client.sdk import cost_report
+    from sky.client.sdk import create_debug_dump
+    from sky.client.sdk import down
+    from sky.client.sdk import download_debug_dump
+    from sky.client.sdk import download_logs
+    from sky.client.sdk import endpoints
+    from sky.client.sdk import exec  # pylint: disable=redefined-builtin
+    from sky.client.sdk import get
+    from sky.client.sdk import get_user_workspace
+    from sky.client.sdk import job_status
+    from sky.client.sdk import launch
+    from sky.client.sdk import optimize
+    from sky.client.sdk import queue
+    from sky.client.sdk import reload_config
+    from sky.client.sdk import set_preferred_workspace
+    from sky.client.sdk import start
+    from sky.client.sdk import status
+    from sky.client.sdk import stop
+    from sky.client.sdk import storage_delete
+    from sky.client.sdk import storage_ls
+    from sky.client.sdk import stream_and_get
+    from sky.client.sdk import tail_logs
+    from sky.dag import Dag
+    from sky.dag import DagExecution
+    from sky.data import FileMountType
+    from sky.data import Storage
+    from sky.data import StorageMode
+    from sky.data import StoreType
+    from sky.jobs import ManagedJobStatus
+    from sky.optimizer import Optimizer
+    from sky.resources import Resources
+    from sky.server.requests.request_names import AdminPolicyRequestName
+    from sky.skylet.job_lib import JobStatus
+    from sky.task import Task
+    from sky.utils.common import OptimizeTarget
+    from sky.utils.common import StatusRefreshMode
+    from sky.utils.config_utils import Config
+    from sky.utils.registry import CLOUD_REGISTRY
+    from sky.utils.registry import JOBS_RECOVERY_STRATEGY_REGISTRY
+    from sky.utils.status_lib import ClusterStatus
+
+    # Aliases.
+    IBM = clouds.IBM
+    AWS = clouds.AWS
+    Azure = clouds.Azure
+    Cudo = clouds.Cudo
+    GCP = clouds.GCP
+    Lambda = clouds.Lambda
+    SCP = clouds.SCP
+    Slurm = clouds.Slurm
+    Kubernetes = clouds.Kubernetes
+    K8s = Kubernetes
+    SSH = clouds.SSH
+    OCI = clouds.OCI
+    Paperspace = clouds.Paperspace
+    PrimeIntellect = clouds.PrimeIntellect
+    RunPod = clouds.RunPod
+    Vast = clouds.Vast
+    Vsphere = clouds.Vsphere
+    Fluidstack = clouds.Fluidstack
+    Nebius = clouds.Nebius
+    Hyperbolic = clouds.Hyperbolic
+    Mithril = clouds.Mithril
+    Shadeform = clouds.Shadeform
+    Seeweb = clouds.Seeweb
+    Yotta = clouds.Yotta
+    Verda = clouds.Verda
+    # pylint: enable=unused-import,ungrouped-imports
 
 # Replaced with the current commit when building the wheels.
 _SKYPILOT_COMMIT_SHA = '{{SKYPILOT_COMMIT_SHA}}'
@@ -88,92 +178,62 @@ _set_http_proxy_env_vars()
 
 # ----------------------------------------------------------------- #
 
-# Keep this order to avoid cyclic imports
-# pylint: disable=wrong-import-position
-from sky import backends
-from sky import batch  # noqa: F401 # pylint: disable=unused-import
-from sky import clouds
-from sky.admin_policy import AdminPolicy
-from sky.admin_policy import MutatedUserRequest
-from sky.admin_policy import UserRequest
-from sky.catalog import list_accelerators
-from sky.client.sdk import api_cancel
-from sky.client.sdk import api_info
-from sky.client.sdk import api_login
-from sky.client.sdk import api_server_logs
-from sky.client.sdk import api_start
-from sky.client.sdk import api_status
-from sky.client.sdk import api_stop
-from sky.client.sdk import autostop
-from sky.client.sdk import cancel
-from sky.client.sdk import cluster_job_spec
-from sky.client.sdk import cost_report
-from sky.client.sdk import create_debug_dump
-from sky.client.sdk import down
-from sky.client.sdk import download_debug_dump
-from sky.client.sdk import download_logs
-from sky.client.sdk import endpoints
-from sky.client.sdk import exec  # pylint: disable=redefined-builtin
-from sky.client.sdk import get
-from sky.client.sdk import get_user_workspace
-from sky.client.sdk import job_status
-from sky.client.sdk import launch
-from sky.client.sdk import optimize
-from sky.client.sdk import queue
-from sky.client.sdk import reload_config
-from sky.client.sdk import set_preferred_workspace
-from sky.client.sdk import start
-from sky.client.sdk import status
-from sky.client.sdk import stop
-from sky.client.sdk import storage_delete
-from sky.client.sdk import storage_ls
-from sky.client.sdk import stream_and_get
-from sky.client.sdk import tail_logs
-from sky.dag import Dag
-from sky.dag import DagExecution
-from sky.data import FileMountType
-from sky.data import Storage
-from sky.data import StorageMode
-from sky.data import StoreType
-from sky.jobs import ManagedJobStatus
-from sky.optimizer import Optimizer
-from sky.resources import Resources
-from sky.server.requests.request_names import AdminPolicyRequestName
-from sky.skylet.job_lib import JobStatus
-from sky.task import Task
-from sky.utils.common import OptimizeTarget
-from sky.utils.common import StatusRefreshMode
-from sky.utils.config_utils import Config
-from sky.utils.registry import CLOUD_REGISTRY
-from sky.utils.registry import JOBS_RECOVERY_STRATEGY_REGISTRY
-from sky.utils.status_lib import ClusterStatus
+# ------------------------ Lazy public API ------------------------ #
+# The public API used to be imported eagerly here, so every ``sky.*`` import
+# (the CLI, and on-cluster code such as ``from sky.skylet import job_lib``) paid
+# for loading most of SkyPilot: ~380 ``sky`` modules plus sqlalchemy, fastapi,
+# numpy, etc. The names below are instead imported on first access by the
+# module ``__getattr__`` (PEP 562), so ``sky.launch``, ``sky.AWS`` and
+# ``from sky import Task`` keep working while ``import sky`` stays cheap.
 
-# Aliases.
-IBM = clouds.IBM
-AWS = clouds.AWS
-Azure = clouds.Azure
-Cudo = clouds.Cudo
-GCP = clouds.GCP
-Lambda = clouds.Lambda
-SCP = clouds.SCP
-Slurm = clouds.Slurm
-Kubernetes = clouds.Kubernetes
-K8s = Kubernetes
-SSH = clouds.SSH
-OCI = clouds.OCI
-Paperspace = clouds.Paperspace
-PrimeIntellect = clouds.PrimeIntellect
-RunPod = clouds.RunPod
-Vast = clouds.Vast
-Vsphere = clouds.Vsphere
-Fluidstack = clouds.Fluidstack
-Nebius = clouds.Nebius
-Hyperbolic = clouds.Hyperbolic
-Mithril = clouds.Mithril
-Shadeform = clouds.Shadeform
-Seeweb = clouds.Seeweb
-Yotta = clouds.Yotta
-Verda = clouds.Verda
+
+def _lazy_from(module: str,
+               *names: str) -> Dict[str, Tuple[str, Optional[str]]]:
+    return {name: (module, name) for name in names}
+
+
+# Public name -> (module that defines it, attribute name in that module, or
+# None if the name is the module itself).
+# yapf: disable
+_LAZY_ATTRIBUTES: Dict[str, Tuple[str, Optional[str]]] = {
+    'backends': ('sky.backends', None),
+    'batch': ('sky.batch', None),
+    'clouds': ('sky.clouds', None),
+    **_lazy_from('sky.admin_policy', 'AdminPolicy', 'MutatedUserRequest',
+                 'UserRequest'),
+    **_lazy_from('sky.catalog', 'list_accelerators'),
+    **_lazy_from('sky.client.sdk', 'api_cancel', 'api_info', 'api_login',
+                 'api_server_logs', 'api_start', 'api_status', 'api_stop',
+                 'autostop', 'cancel', 'cluster_job_spec', 'cost_report',
+                 'create_debug_dump', 'down', 'download_debug_dump',
+                 'download_logs', 'endpoints', 'exec', 'get',
+                 'get_user_workspace', 'job_status', 'launch', 'optimize',
+                 'queue', 'reload_config', 'set_preferred_workspace', 'start',
+                 'status', 'stop', 'storage_delete', 'storage_ls',
+                 'stream_and_get', 'tail_logs'),
+    **_lazy_from('sky.dag', 'Dag', 'DagExecution'),
+    **_lazy_from('sky.data', 'FileMountType', 'Storage', 'StorageMode',
+                 'StoreType'),
+    **_lazy_from('sky.jobs', 'ManagedJobStatus'),
+    **_lazy_from('sky.optimizer', 'Optimizer'),
+    **_lazy_from('sky.resources', 'Resources'),
+    **_lazy_from('sky.server.requests.request_names', 'AdminPolicyRequestName'),
+    **_lazy_from('sky.skylet.job_lib', 'JobStatus'),
+    **_lazy_from('sky.task', 'Task'),
+    **_lazy_from('sky.utils.common', 'OptimizeTarget', 'StatusRefreshMode'),
+    **_lazy_from('sky.utils.config_utils', 'Config'),
+    **_lazy_from('sky.utils.registry', 'CLOUD_REGISTRY',
+                 'JOBS_RECOVERY_STRATEGY_REGISTRY'),
+    **_lazy_from('sky.utils.status_lib', 'ClusterStatus'),
+    # Cloud aliases.
+    **_lazy_from('sky.clouds', 'IBM', 'AWS', 'Azure', 'Cudo', 'GCP', 'Lambda',
+                 'SCP', 'Slurm', 'Kubernetes', 'SSH', 'OCI', 'Paperspace',
+                 'PrimeIntellect', 'RunPod', 'Vast', 'Vsphere', 'Fluidstack',
+                 'Nebius', 'Hyperbolic', 'Mithril', 'Shadeform', 'Seeweb',
+                 'Yotta', 'Verda'),
+    'K8s': ('sky.clouds', 'Kubernetes'),
+}
+# yapf: enable
 
 __all__ = [
     '__version__',
@@ -375,20 +435,47 @@ class _ClientSdkFinder(importlib.abc.MetaPathFinder):
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
-    """Lazily resolve client SDKs registered under ``sky.client_sdks``.
+    """Lazily resolve the public API, submodules and registered client SDKs.
 
     PEP 562 module hook, consulted only for attributes not already defined on
-    ``sky``, so it never shadows real submodules or symbols. This handles bare
-    attribute access (``import sky; sky.foo``), which does not go through the
-    meta-path finder above.
+    ``sky``, so it never shadows real submodules or symbols. In order:
+
+    1. Names in _LAZY_ATTRIBUTES (``sky.launch``, ``sky.Task``, ``sky.AWS``,
+       ...) are imported from their module and cached on ``sky``.
+    2. ``sky.<submodule>`` (e.g. ``sky.jobs``, ``sky.serve``,
+       ``sky.exceptions``) is imported. These used to be loaded as a side
+       effect of ``import sky``, so code that only does ``import sky`` relies
+       on them being reachable as attributes.
+    3. Client SDKs registered under ``sky.client_sdks``. The import in step 2
+       routes through _ClientSdkFinder, which binds ``sky.<name>`` and
+       registers it in sys.modules; this handles bare attribute access
+       (``import sky; sky.foo``), which does not go through the meta-path
+       finder above. Any error importing the SDK propagates unchanged.
     """
+    lazy_attribute = _LAZY_ATTRIBUTES.get(name)
+    if lazy_attribute is not None:
+        module_name, attribute_name = lazy_attribute
+        module = importlib.import_module(module_name)
+        value = (module if attribute_name is None else getattr(
+            module, attribute_name))
+        # Cache it so that later accesses do not go through this hook.
+        globals()[name] = value
+        return value
     if name.startswith('_'):
         raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
-    if _find_client_sdk_entry_point(name) is None:
-        raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
-    # Routes through _ClientSdkFinder, which binds ``sky.<name>`` and registers
-    # it in sys.modules; any error importing the SDK propagates unchanged.
-    return importlib.import_module(f'{__name__}.{name}')
+    submodule_name = f'{__name__}.{name}'
+    try:
+        return importlib.import_module(submodule_name)
+    except ModuleNotFoundError as e:
+        # Only a missing ``sky.<name>`` means "no such attribute"; a missing
+        # dependency of an existing submodule or SDK propagates.
+        if e.name != submodule_name:
+            raise
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
+
+def __dir__() -> List[str]:  # pylint: disable=invalid-name
+    return sorted(set(globals()) | set(_LAZY_ATTRIBUTES))
 
 
 if not any(isinstance(finder, _ClientSdkFinder) for finder in sys.meta_path):

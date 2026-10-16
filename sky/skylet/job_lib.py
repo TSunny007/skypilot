@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import colorama
 import filelock
 
-from sky import global_user_state
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.skylet import constants
@@ -32,10 +31,14 @@ from sky.utils.db import db_utils
 if typing.TYPE_CHECKING:
     import psutil
 
+    from sky import global_user_state
     from sky.schemas.generated import jobsv1_pb2
 else:
     psutil = adaptors_common.LazyImport('psutil')
     jobsv1_pb2 = adaptors_common.LazyImport('sky.schemas.generated.jobsv1_pb2')
+    # Lazy: only needed client-side (load_job_queue); importing it on the
+    # cluster pulls in sqlalchemy, alembic and the config schema.
+    global_user_state = adaptors_common.LazyImport('sky.global_user_state')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -1451,6 +1454,47 @@ class JobLibCodeGen:
             'else [job_lib.get_latest_job_id()]',
             'job_statuses = job_lib.get_statuses_payload(job_ids)',
             'print(job_statuses, flush=True)',
+        ]
+        return cls._build(code)
+
+    @classmethod
+    def get_job_status_with_end_time(
+            cls, job_ids: Optional[List[int]] = None) -> str:
+        """get_job_status, plus the end time of a terminal job.
+
+        Prints exactly what get_job_status prints (the untyped statuses
+        payload, first), then one more line: the ended timestamp of the first
+        terminal job as a 'job-end-time' payload, or an empty line if no job
+        is terminal or the read fails. Everything after the statuses line is
+        best-effort and calls only head-side functions that have existed
+        since 2023, so a head running an older SkyPilot still returns the
+        statuses; the caller reads the end time separately when it is absent.
+        """
+        code = [
+            f'job_ids = {job_ids} if {job_ids} is not None '
+            'else [job_lib.get_latest_job_id()]',
+            'job_statuses = job_lib.get_statuses_payload(job_ids)',
+            'print(job_statuses, flush=True)',
+            # The leading '\n' starts a new logical line at column 0 (_build
+            # joins the statements with ';'), so the compound statement is
+            # valid and the final print is not absorbed into it.
+            '\nend_time_payload = ""'
+            '\ntry:'
+            '\n  from sky.utils import message_utils'
+            '\n  for job_id, status in job_lib.load_statuses_payload('
+            'job_statuses).items():'
+            '\n    if job_id is not None and status is not None and '
+            'status.is_terminal():'
+            '\n      end_time = message_utils.decode_payload('
+            'job_lib.get_job_submitted_or_ended_timestamp_payload('
+            'job_id, True))'
+            '\n      if end_time is not None:'
+            '\n        end_time_payload = message_utils.encode_payload('
+            'end_time, "job-end-time")'
+            '\n      break'
+            '\nexcept Exception:'
+            '\n  pass'
+            '\nprint(end_time_payload, flush=True)',
         ]
         return cls._build(code)
 

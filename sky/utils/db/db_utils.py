@@ -13,18 +13,27 @@ import urllib.parse
 
 import aiosqlite
 import aiosqlite.context
-import sqlalchemy
-from sqlalchemy import exc as sqlalchemy_exc
-from sqlalchemy.ext import asyncio as sqlalchemy_async
 
 from sky import sky_logging
+from sky.adaptors import common as adaptors_common
 from sky.skylet import constants
 from sky.skylet import runtime_utils
-from sky.utils.db import sql_metrics
 
 logger = sky_logging.init_logger(__name__)
 if typing.TYPE_CHECKING:
+    import sqlalchemy
+    from sqlalchemy import exc as sqlalchemy_exc
+    from sqlalchemy.ext import asyncio as sqlalchemy_async
     from sqlalchemy.orm import Session
+
+    from sky.utils.db import sql_metrics
+else:
+    # Lazy: sqlalchemy takes ~0.2 s to import, and on-cluster users of this
+    # module (job_lib, the skylet configs) only use the sqlite3 helpers.
+    sqlalchemy = adaptors_common.LazyImport('sqlalchemy')
+    sqlalchemy_exc = adaptors_common.LazyImport('sqlalchemy.exc')
+    sqlalchemy_async = adaptors_common.LazyImport('sqlalchemy.ext.asyncio')
+    sql_metrics = adaptors_common.LazyImport('sky.utils.db.sql_metrics')
 
 # This parameter (passed to sqlite3.connect) controls how long we will wait to
 # obtains a database lock (not necessarily during connection, but whenever it is
@@ -128,8 +137,8 @@ def add_column_to_table(
 
 
 def add_all_tables_to_db_sqlalchemy(
-    metadata: sqlalchemy.MetaData,
-    engine: Union[sqlalchemy.Engine, sqlalchemy.engine.Connection],
+    metadata: 'sqlalchemy.MetaData',
+    engine: Union['sqlalchemy.Engine', 'sqlalchemy.engine.Connection'],
 ):
     """Add tables to the database."""
     for table in metadata.tables.values():
@@ -144,8 +153,8 @@ def add_all_tables_to_db_sqlalchemy(
 
 
 def add_table_to_db_sqlalchemy(
-    metadata: sqlalchemy.MetaData,
-    engine: Union[sqlalchemy.Engine, sqlalchemy.engine.Connection],
+    metadata: 'sqlalchemy.MetaData',
+    engine: Union['sqlalchemy.Engine', 'sqlalchemy.engine.Connection'],
     table_name: str,
 ):
     """Add a specific table to the database."""
@@ -168,7 +177,7 @@ def add_column_to_table_sqlalchemy(
     session: 'Session',
     table_name: str,
     column_name: str,
-    column_type: sqlalchemy.types.TypeEngine,
+    column_type: 'sqlalchemy.types.TypeEngine',
     default_statement: Optional[str] = None,
     copy_from: Optional[str] = None,
     value_to_replace_existing_entries: Optional[Any] = None,
@@ -213,7 +222,7 @@ def add_column_to_table_sqlalchemy(
 def add_column_to_table_alembic(
     table_name: str,
     column_name: str,
-    column_type: sqlalchemy.types.TypeEngine,
+    column_type: 'sqlalchemy.types.TypeEngine',
     server_default: Optional[str] = None,
     copy_from: Optional[str] = None,
     value_to_replace_existing_entries: Optional[Any] = None,
@@ -432,8 +441,8 @@ class DatabaseManager:
     def __init__(
         self,
         db_name: str,
-        create_table_fn: Callable[[sqlalchemy.engine.Engine], Any],
-        post_init_fn: Optional[Callable[[sqlalchemy.engine.Engine],
+        create_table_fn: Callable[['sqlalchemy.engine.Engine'], Any],
+        post_init_fn: Optional[Callable[['sqlalchemy.engine.Engine'],
                                         Any]] = None,
     ):
         self._db_name = db_name
@@ -443,7 +452,7 @@ class DatabaseManager:
         self._engine: Optional[sqlalchemy.engine.Engine] = None
         self._engine_async: Optional[sqlalchemy_async.AsyncEngine] = None
 
-    def get_engine(self) -> sqlalchemy.engine.Engine:
+    def get_engine(self) -> 'sqlalchemy.engine.Engine':
         """Lazy sync engine init with double-checked locking."""
         if self._engine is not None:
             return self._engine
@@ -467,7 +476,7 @@ class DatabaseManager:
                 self._post_init_fn(engine)
             return self._engine
 
-    async def get_async_engine(self) -> sqlalchemy_async.AsyncEngine:
+    async def get_async_engine(self) -> 'sqlalchemy_async.AsyncEngine':
         """Lazy async engine init; delegates table creation to get_engine."""
         if self._engine_async is not None:
             return self._engine_async
@@ -488,8 +497,8 @@ class DatabaseManager:
 
 
 _max_connections = 0
-_postgres_engine_cache: Dict[str, sqlalchemy.engine.Engine] = {}
-_sqlite_engine_cache: Dict[str, sqlalchemy.engine.Engine] = {}
+_postgres_engine_cache: Dict[str, 'sqlalchemy.engine.Engine'] = {}
+_sqlite_engine_cache: Dict[str, 'sqlalchemy.engine.Engine'] = {}
 
 _db_creation_lock = threading.Lock()
 
@@ -604,7 +613,7 @@ def _make_asyncpg_creator(dsn: str) -> Callable[[], Any]:
     return _connect
 
 
-def psycopg2_url(conn_string: str) -> sqlalchemy.engine.URL:
+def psycopg2_url(conn_string: str) -> 'sqlalchemy.engine.URL':
     """Return *conn_string* as a URL that selects the psycopg2 driver.
 
     SQLAlchemy 2.1 resolves a bare ``postgresql://`` URL to psycopg 3, which
@@ -846,7 +855,7 @@ def _install_idle_in_transaction_timeout(engine: Any) -> None:
 def get_engine(db_name: Optional[str],
                async_engine: Literal[False] = False,
                direct: bool = False,
-               no_pool: bool = False) -> sqlalchemy.engine.Engine:
+               no_pool: bool = False) -> 'sqlalchemy.engine.Engine':
     ...
 
 
@@ -854,7 +863,7 @@ def get_engine(db_name: Optional[str],
 def get_engine(db_name: Optional[str],
                async_engine: Literal[True],
                direct: bool = False,
-               no_pool: bool = False) -> sqlalchemy_async.AsyncEngine:
+               no_pool: bool = False) -> 'sqlalchemy_async.AsyncEngine':
     ...
 
 
@@ -863,7 +872,7 @@ def get_engine(
     async_engine: bool = False,
     direct: bool = False,
     no_pool: bool = False,
-) -> Union[sqlalchemy.engine.Engine, sqlalchemy_async.AsyncEngine]:
+) -> Union['sqlalchemy.engine.Engine', 'sqlalchemy_async.AsyncEngine']:
     """Get the engine for the given database name.
 
     Args:

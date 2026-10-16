@@ -31,12 +31,14 @@ from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.batch import coordinator as batch_coordinator
 from sky.data import data_utils
+from sky.jobs import claim_wake
 from sky.jobs import constants as jobs_constants
 from sky.jobs import file_content_utils
 from sky.jobs import job_group_networking
 from sky.jobs import log_gc
 from sky.jobs import recovery_strategy
 from sky.jobs import runtime as managed_job_runtime
+from sky.jobs import scheduler
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
 from sky.metrics import utils as metrics_lib
@@ -1359,6 +1361,10 @@ class JobController:
             # Get job status (skip on first iteration if forcing recovery)
             job_status = None
             transient_job_check_error_reason = None
+            # The job's end time folded into the status read when the job was
+            # already terminal (SSH/codegen path only); the terminal branches
+            # below skip the separate end-time query when it is set.
+            end_time_from_status: Optional[float] = None
             # Per-node exit codes of the failed run, populated only when
             # recovery is triggered by a job failure (not an infra-level
             # failure like preemption). Reset each iteration so a stale
@@ -1424,14 +1430,15 @@ class JobController:
                 # A failed status fetch leaves job_status=None; the checks
                 # below distinguish transient errors from recovery conditions.
                 try:
-                    job_status, transient_job_check_error_reason = (
-                        await managed_job_utils.get_job_status(
-                            self._backend,
-                            cluster_name,
-                            job_id=job_id_on_pool_cluster,
-                            status_logger=status_logger,
-                            handle=runtime_handle,
-                        ))
+                    (job_status, end_time_from_status,
+                     transient_job_check_error_reason) = (
+                         await managed_job_utils.get_job_status_and_end_time(
+                             self._backend,
+                             cluster_name,
+                             job_id=job_id_on_pool_cluster,
+                             status_logger=status_logger,
+                             handle=runtime_handle,
+                         ))
                 except exceptions.FetchClusterInfoError as fetch_e:
                     status_logger.reset()
                     logger.info(
@@ -1522,9 +1529,13 @@ class JobController:
             if job_status == job_lib.JobStatus.SUCCEEDED:
                 logger.info(f'Task {task_id} succeeded! '
                             'Getting end time and cleaning up')
-                success_end_time = await asyncio.to_thread(
-                    managed_job_utils.try_to_get_job_end_time, self._backend,
-                    cluster_name, job_id_on_pool_cluster)
+                success_end_time = end_time_from_status
+                if success_end_time is None:
+                    # The status read did not fold in the end time (gRPC
+                    # path, runtime plugin, or an old cluster).
+                    success_end_time = await asyncio.to_thread(
+                        managed_job_utils.try_to_get_job_end_time,
+                        self._backend, cluster_name, job_id_on_pool_cluster)
 
                 # The job is done. Set the job to SUCCEEDED first before start
                 # downloading and streaming the logs to make it more responsive.
@@ -1711,9 +1722,13 @@ class JobController:
                     # The user code has probably crashed, fail immediately.
                     logger.info(
                         f'Task {task_id} failed with status: {job_status}')
-                    end_time = await asyncio.to_thread(
-                        managed_job_utils.try_to_get_job_end_time,
-                        self._backend, cluster_name, job_id_on_pool_cluster)
+                    end_time = end_time_from_status
+                    if end_time is None:
+                        # The status read did not fold in the end time (gRPC
+                        # path, runtime plugin, or an old cluster).
+                        end_time = await asyncio.to_thread(
+                            managed_job_utils.try_to_get_job_end_time,
+                            self._backend, cluster_name, job_id_on_pool_cluster)
                     logger.info(
                         f'The user job failed ({job_status}). Please check the '
                         'logs below.\n'
@@ -3530,6 +3545,75 @@ class JobController:
                 task=self._dag.tasks[task_id]))
 
 
+# How often an idle controller polls the jobs DB for a WAITING job. The poll is
+# the fallback for a job whose wake-up (sky/jobs/claim_wake.py) was lost.
+_CLAIM_POLL_INTERVAL_SECONDS = 10.0
+# How often a controller recomputes its turn among the live controllers.
+_CLAIM_POLL_SLOT_REFRESH_SECONDS = 60.0
+# A poll due this soon after the last claim is moved to the next interval:
+# it would repeat a claim that just ran.
+_CLAIM_POLL_MIN_GAP_SECONDS = 0.05
+
+
+class _ClaimPollSchedule:
+    """When an idle controller next polls for a WAITING job.
+
+    Each controller polls once per _CLAIM_POLL_INTERVAL_SECONDS, and the
+    controllers on a host take turns: their polls are pinned to the wall clock
+    and spread evenly over the interval, in the order the live controllers
+    started. A job whose wake-up was lost then waits at most about
+    interval / (number of controllers), at the same DB load as before.
+
+    Pinning the polls to the wall clock keeps them from drifting together.
+    Controllers that start 0.5 s apart and sleep a fixed interval poll in a
+    burst at the start of each interval and leave the rest of it uncovered.
+    """
+
+    def __init__(self,
+                 pid: int,
+                 started_at: float,
+                 interval: float = _CLAIM_POLL_INTERVAL_SECONDS) -> None:
+        self._pid = pid
+        self._started_at = started_at
+        self._interval = interval
+        self._rank = 0
+        self._count = 1
+        self._refreshed_at: Optional[float] = None
+
+    def _refresh_turn(self) -> None:
+        """Find this controller's place among the live controllers."""
+        records = scheduler.get_controller_process_records()
+        if records is None:
+            # The PID file is unreadable right now; keep the last turn.
+            return
+        started_at_by_pid = {self._pid: self._started_at}
+        for record in records:
+            if (record.pid not in started_at_by_pid and
+                    managed_job_utils.controller_process_alive(record)):
+                started_at_by_pid[record.pid] = record.started_at or 0.0
+        order = sorted(started_at_by_pid,
+                       key=lambda pid: (started_at_by_pid[pid], pid))
+        self._rank = order.index(self._pid)
+        self._count = len(order)
+
+    async def next_delay(self, now: Optional[float] = None) -> float:
+        """Seconds until this controller's next poll."""
+        now = time.time() if now is None else now
+        if (self._refreshed_at is None or
+                now - self._refreshed_at >= _CLAIM_POLL_SLOT_REFRESH_SECONDS):
+            self._refreshed_at = now
+            try:
+                await asyncio.to_thread(self._refresh_turn)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug(f'Failed to find this controller\'s poll turn: '
+                             f'{e}')
+        offset = self._interval * self._rank / self._count
+        delay = (offset - now) % self._interval
+        if delay < _CLAIM_POLL_MIN_GAP_SECONDS:
+            delay += self._interval
+        return delay
+
+
 class ControllerManager:
     """Main loop for a job controller process.
 
@@ -4297,6 +4381,10 @@ class ControllerManager:
         """Monitor the job loop."""
         logger.info(f'Starting monitor loop for pid {self._pid}...')
         pid_str = str(self._pid)
+        wake = claim_wake.WakeListener()
+        poll_schedule = _ClaimPollSchedule(self._pid, self._pid_started_at)
+        # Whether the last wait ended with a wake-up token.
+        woken = False
 
         while True:
             async with self._job_tasks_lock:
@@ -4349,9 +4437,20 @@ class ControllerManager:
                 continue
 
             if waiting_job is None:
-                logger.info('No waiting job, waiting for 10 seconds')
-                await asyncio.sleep(10)
+                if woken and wake.drain():
+                    # Woken, but the claim found nothing, so the tokens still
+                    # queued are stale and are dropped. Claim once more: a
+                    # token queued after that claim was dropped with them.
+                    woken = False
+                    continue
+                delay = await poll_schedule.next_delay()
+                logger.info(f'No waiting job, waiting up to {delay:.1f} '
+                            'seconds')
+                woken = await wake.wait(delay)
+                if woken:
+                    logger.info('Woken up for a waiting job')
                 continue
+            woken = False
 
             logger.info(f'Claiming job {waiting_job["job_id"]}')
             job_id = waiting_job['job_id']

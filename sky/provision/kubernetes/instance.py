@@ -19,6 +19,7 @@ from sky.provision import constants
 from sky.provision import docker_utils
 from sky.provision.kubernetes import config as config_lib
 from sky.provision.kubernetes import constants as k8s_constants
+from sky.provision.kubernetes import fast_start
 from sky.provision.kubernetes import host_network_ports
 from sky.provision.kubernetes import host_network_probe
 from sky.provision.kubernetes import utils as kubernetes_utils
@@ -2788,6 +2789,18 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                  f'{[pod.metadata.name for pod in pods]}')
 
     assert head_pod_name is not None, 'head_instance_id should not be None'
+    runtime_metadata = common.ProvisionRuntimeMetadata()
+    if config.provider_config.get('fast_start') and not running_pods:
+        # Every pod is new and starts the job itself: each writes its
+        # per-node setup script and the head registers and queues the job
+        # (kubernetes/fast_start.py). The host still does the runtime setup
+        # (credentials, wheel, skylet) and the workdir / file-mount sync, so
+        # those flags stay False. Pods that already existed (a relaunch onto
+        # the cluster) carry no new job, so that launch takes the regular path.
+        runtime_metadata = common.ProvisionRuntimeMetadata(
+            setup_done=True,
+            run_started=True,
+        )
     return common.ProvisionRecord(
         provider_name='kubernetes',
         region=region,
@@ -2796,6 +2809,7 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         head_instance_id=head_pod_name,
         resumed_instance_ids=[],
         created_instance_ids=list(created_pods.keys()),
+        runtime_metadata=runtime_metadata,
     )
 
 
@@ -3079,6 +3093,8 @@ def terminate_instances(
         # Only do this when terminating the entire cluster, not when
         # terminating workers only (head services should remain).
         _delete_cluster_services(cluster_name_on_cloud, namespace, context)
+        if provider_config.get('fast_start'):
+            fast_start.delete_objects(cluster_name_on_cloud, namespace, context)
 
 
 def cleanup_cluster_resources(
@@ -3099,6 +3115,8 @@ def cleanup_cluster_resources(
     namespace = kubernetes_utils.get_namespace_from_config(provider_config)
     context = kubernetes_utils.get_control_context_from_config(provider_config)
     _delete_cluster_services(cluster_name_on_cloud, namespace, context)
+    if provider_config.get('fast_start'):
+        fast_start.delete_objects(cluster_name_on_cloud, namespace, context)
 
 
 # The probe runs as soon as ray-installation finishes in step 2 of the

@@ -4,6 +4,7 @@ This is a remote utility module that provides logging functionality.
 """
 import copy
 import functools
+import importlib.util
 import io
 import multiprocessing.pool
 import os
@@ -455,6 +456,115 @@ def run_bash_command_with_log_and_return_pid(
                                             with_ray,
                                             streaming_prefix=streaming_prefix)
     return {'return_code': return_code, 'pid': os.getpid()}
+
+
+def _start_subprocess_daemon(proc_pid: int) -> None:
+    """Spawns the kill daemon for a task subprocess. STDLIB-ONLY.
+
+    Same inlining contract as run_task_script_with_log_and_return_pid. The
+    daemon (subprocess_daemon.py) watches this process -- the Ray worker --
+    and kills the task's process tree once it dies: on `sky cancel` (the
+    driver is killpg'd and Ray reaps the job's workers) and on fail-fast
+    (ray.cancel(force=True) kills the worker).
+
+    The daemon file is located through the spec of the top-level `sky`
+    package: find_spec resolves the installed package path without
+    executing sky/__init__, whereas subprocess_utils.kill_process_daemon
+    locates the same file through log_lib.__file__ and so needs sky
+    imported. --initial-children is left at its default (empty): at spawn
+    the bash process is milliseconds old and has no children yet, which is
+    also what kill_process_daemon's snapshot yields in practice.
+    """
+    spec = importlib.util.find_spec('sky')
+    if spec is None or not spec.submodule_search_locations:
+        return
+    daemon_path = os.path.join(
+        list(spec.submodule_search_locations)[0], 'skylet',
+        'subprocess_daemon.py')
+    if not os.path.exists(daemon_path):
+        return
+    # No start_new_session: the daemon detaches itself by double-forking.
+    subprocess.Popen([
+        sys.executable, daemon_path, '--parent-pid',
+        str(os.getpid()), '--proc-pid',
+        str(proc_pid)
+    ],
+                     stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+
+
+def run_task_script_with_log_and_return_pid(script: str,
+                                            log_path: str) -> Dict[str, int]:
+    """Runs a fully rendered task bash script; returns its rc and this pid.
+
+    STDLIB-ONLY BY CONTRACT: the generated Ray job driver inlines this
+    function's source (task_codegen.RayCodeGen) and Ray workers execute it.
+    Functions defined in the driver are pickled by value, so every global
+    name used here must be a stdlib module imported by the generated
+    program or a function inlined alongside (_start_subprocess_daemon).
+    Anything from sky would make each Ray worker import sky -- the eager
+    sky/__init__ costs seconds per node, on the critical path of every
+    multi-node job. The script is therefore rendered by the driver
+    (make_task_bash_script needs the sky constants, which the driver has
+    already imported) and passed in final form.
+
+    Mirrors run_with_log(..., stream_logs=True, with_ray=True, shell=True)
+    as used by the driver before: stderr is merged into stdout and every
+    line is printed (Ray's log monitor streams worker stdout to the driver,
+    which prefixes it with the task name) and appended to log_path; the two
+    `bash -i` job-control warnings are dropped; a trailing CRLF becomes LF
+    so the driver log does not double-space lines.
+    """
+    with tempfile.NamedTemporaryFile('w', prefix='sky_app_',
+                                     delete=False) as fp:
+        fp.write(script)
+        script_path = fp.name
+
+    log_path = os.path.expanduser(log_path)
+    log_dir = os.path.dirname(log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    skip_lines = (
+        # Printed by `bash -i` without a controlling terminal.
+        'bash: cannot set terminal process group',
+        'bash: no job control in this shell',
+    )
+    # `-i` so that `source ~/.bashrc` in the script works.
+    proc = subprocess.Popen(f'/bin/bash -i {script_path}',
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL,
+                            shell=True,
+                            start_new_session=True)
+    try:
+        _start_subprocess_daemon(proc.pid)
+        out_io = io.TextIOWrapper(proc.stdout,
+                                  encoding='utf-8',
+                                  newline='',
+                                  errors='replace',
+                                  write_through=True)
+        with open(log_path, 'a', encoding='utf-8') as fout:
+            for line in iter(out_io.readline, ''):
+                if line.endswith('\r\n'):
+                    line = line[:-2] + '\n'
+                if any(skip in line for skip in skip_lines):
+                    continue
+                print(line, end='', flush=True)
+                if log_path != '/dev/null':
+                    fout.write(line)
+                    fout.flush()
+        proc.wait()
+    except KeyboardInterrupt:
+        # ray.cancel(force=False) interrupts the task: kill the task's
+        # session (its process group, as start_new_session made bash the
+        # leader) so its output stops, like run_with_log does.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raise
+    return {'return_code': proc.returncode, 'pid': os.getpid()}
 
 
 def start_orphan_watchdog() -> None:

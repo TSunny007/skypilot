@@ -4,7 +4,7 @@ A container buys two things the host cannot provide itself:
 
 * a hard nofile limit different from the host's own -- raising a hard limit
   needs CAP_SYS_RESOURCE, which a test process does not have;
-* a private pid namespace, so the ``pgrep -f raylet/raylet`` inside
+* a private pid namespace, so the ``pgrep -x raylet`` inside
   ``RAY_PRLIMIT`` matches only this test's stand-in raylet rather than an
   unrelated process on the machine.
 
@@ -55,8 +55,10 @@ _TIMEOUT = 300
 _HARD_BELOW_TARGET = 524288
 _HARD_ABOVE_TARGET = 2 * _TARGET
 
-# Run inside the container, fed over stdin so that the container's own command
-# line does not contain "raylet/raylet" and confuse pgrep. `sudo` is shimmed
+# Run inside the container, fed over stdin. `pgrep -x raylet` matches the
+# process *name* (comm), which comes from the executable's basename -- not
+# argv[0] -- so the stand-in raylet is a copy of `sleep` named `raylet`;
+# `exec -a` would leave comm as `sleep` and never match. `sudo` is shimmed
 # because RAY_PRLIMIT calls `sudo prlimit` and the image has no sudo package;
 # the container is root, which is also what the K8s template assumes (it
 # defines an equivalent no-op sudo shell function).
@@ -75,13 +77,14 @@ _HARD_ABOVE_TARGET = 2 * _TARGET
 _SCRIPT = f"""
 set +e
 printf '#!/bin/sh\\nexec "$@"\\n' > /usr/local/bin/sudo && chmod +x /usr/local/bin/sudo
+cp "$(command -v sleep)" /tmp/raylet
 limits() {{ awk '/Max open files/ {{print $4, $5}}' /proc/$1/limits; }}
 echo "BEFORE=$(ulimit -Sn) $(ulimit -Hn)"
-exec -a raylet/raylet sleep 300 &
+/tmp/raylet 300 &
 STALE=$!
 {instance_setup.RAISE_NOFILE_LIMIT_CMD}
 echo "SHELL=$(ulimit -Sn) $(ulimit -Hn)"
-exec -a raylet/raylet sleep 300 &
+/tmp/raylet 300 &
 FRESH=$!
 sleep 0.5
 echo "STALE_BEFORE=$(limits $STALE)"
