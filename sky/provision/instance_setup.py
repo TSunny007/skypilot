@@ -623,8 +623,23 @@ _SHARED_RAY_PORT_FLAGS = (
 
 
 def ray_head_start_command(custom_resource: Optional[str],
-                           custom_ray_options: Optional[Dict[str, Any]]) -> str:
-    """Returns the command to start Ray on the head node."""
+                           custom_ray_options: Optional[Dict[str, Any]],
+                           wait_initialized: bool = True) -> str:
+    """Returns the command to start Ray on the head node.
+
+    Args:
+        wait_initialized: End with RAY_HEAD_WAIT_INITIALIZED_COMMAND, which
+            polls `ray status` until the autoscaler monitor has published
+            its first status, so that a status refresh right after
+            provisioning does not see an uninitialized cluster. Kubernetes
+            pods run this command in their own bootstrap, where the loop
+            gates nothing (pass False): the pod's readiness markers are set
+            before Ray starts, and the provisioner itself waits until the
+            cluster's nodes are all up. There the loop only burns head CPU
+            on repeated Ray CLI imports (2.4 s warm, 6.8 s cold per `ray
+            status`) while the worker pods' Ray starts and the provisioner's
+            checks compete for it.
+    """
     ray_options = (
         # --disable-usage-stats in `ray start` saves 10 seconds of idle wait.
         f'--disable-usage-stats '
@@ -673,7 +688,9 @@ def ray_head_start_command(custom_resource: Optional[str],
         # the warning when the worker count is >12x CPUs.
         'RAY_worker_maximum_startup_concurrency=$(( 3 * $(nproc --all) )) '
         f'{constants.SKY_RAY_CMD} start --head {ray_options} || exit 1;' +
-        RAY_PRLIMIT + DUMP_RAY_PORTS + RAY_HEAD_WAIT_INITIALIZED_COMMAND)
+        RAY_PRLIMIT + DUMP_RAY_PORTS)
+    if wait_initialized:
+        cmd += RAY_HEAD_WAIT_INITIALIZED_COMMAND
     return cmd
 
 

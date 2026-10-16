@@ -8,7 +8,8 @@ Covers the launch-latency levers:
   the pod command text),
 * the ray-status health check encoding its port payload without importing
   sky (the eager `sky/__init__` costs seconds per check),
-* the setuptools/click pins skipped when already satisfied.
+* the setuptools/click pins skipped when already satisfied,
+* no `ray status` wait loop at the end of the Kubernetes pods' head start.
 """
 import importlib.metadata
 import os
@@ -74,6 +75,27 @@ class TestHeadDashboardDisabled:
             custom_ray_options={'include-dashboard': 'true'})
         assert cmd.rindex('--include-dashboard=true') > cmd.index(
             '--include-dashboard=false')
+
+
+class TestHeadWaitInitialized:
+    """The `ray status` wait loop after `ray start --head` is optional."""
+
+    def test_included_by_default(self):
+        cmd = instance_setup.ray_head_start_command(custom_resource=None,
+                                                    custom_ray_options=None)
+        assert cmd.endswith(instance_setup.RAY_HEAD_WAIT_INITIALIZED_COMMAND)
+
+    def test_omitted_when_not_waiting(self):
+        cmd = instance_setup.ray_head_start_command(custom_resource=None,
+                                                    custom_ray_options=None,
+                                                    wait_initialized=False)
+        assert instance_setup.RAY_HEAD_WAIT_INITIALIZED_COMMAND not in cmd
+        # Everything else is unchanged.
+        assert cmd.endswith(instance_setup.RAY_PRLIMIT +
+                            instance_setup.DUMP_RAY_PORTS)
+        assert cmd + instance_setup.RAY_HEAD_WAIT_INITIALIZED_COMMAND == (
+            instance_setup.ray_head_start_command(custom_resource=None,
+                                                  custom_ray_options=None))
 
 
 class TestRayPrlimit:
