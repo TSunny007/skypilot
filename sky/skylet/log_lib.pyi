@@ -143,6 +143,15 @@ def run_bash_command_with_log_and_return_pid(
     ...
 
 
+def _start_subprocess_daemon(proc_pid: int) -> None:
+    ...
+
+
+def run_task_script_with_log_and_return_pid(script: str,
+                                            log_path: str) -> Dict[str, int]:
+    ...
+
+
 def start_orphan_watchdog() -> None:
     ...
 

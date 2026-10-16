@@ -1427,7 +1427,7 @@ class Kubernetes(clouds.Cloud):
             'ray_patches_cmd': instance_setup.ray_patches_cmd(
                 constants.SKY_REMOTE_RAY_VERSION),
             'ray_head_start_command': instance_setup.ray_head_start_command(
-                custom_resources, custom_ray_options),
+                custom_resources, custom_ray_options, wait_initialized=False),
             'skypilot_ray_port': constants.SKY_REMOTE_RAY_PORT,
             'ray_worker_start_command': instance_setup.ray_worker_start_command(
                 custom_resources, custom_ray_options, no_restart=False),
