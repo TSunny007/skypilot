@@ -27,13 +27,21 @@ def _isolate_context():
     to order the suite, so the failures move between files and between runs.
     Resetting here removes the coupling instead of chasing it one victim at
     a time.
+
+    With no context set, ``context.set_context_var`` writes process-global
+    vars instead (e.g. the request id that ``set_request_context`` records
+    when a test runs a request wrapper on the main thread), which leak the
+    same way; restore those too.
     """
     # pylint: disable=protected-access
     token = context._CONTEXT.set(None)
+    saved_process_vars = dict(context._PROCESS_GLOBAL_VARS)
     try:
         yield
     finally:
         context._CONTEXT.reset(token)
+        context._PROCESS_GLOBAL_VARS.clear()
+        context._PROCESS_GLOBAL_VARS.update(saved_process_vars)
 
 
 @pytest.fixture(autouse=True)
