@@ -1,9 +1,17 @@
 """Utils for workspaces."""
+import typing
 from typing import Any, Dict, List, Optional, Set
 
 from sky import skypilot_config
-from sky.users import resolver as user_resolver
+from sky.adaptors import common as adaptors_common
 from sky.workspaces import constants as workspace_constants
+
+if typing.TYPE_CHECKING:
+    from sky.users import resolver as user_resolver
+else:
+    # Lazy: sky.users.resolver imports sky.users.permission and
+    # sky.users.rbac, which import this module.
+    user_resolver = adaptors_common.LazyImport('sky.users.resolver')
 
 
 def get_default_read_access() -> str:
@@ -75,7 +83,7 @@ def is_read_only_workspace(workspace_name: str) -> bool:
 
 def get_workspace_users(
         workspace_config: Dict[str, Any],
-        resolver: Optional[user_resolver.UserResolver] = None) -> List[str]:
+        resolver: Optional['user_resolver.UserResolver'] = None) -> List[str]:
     """Get the user_ids that should have access to a workspace.
 
     For private workspaces, resolves ``allowed_users`` (which may contain

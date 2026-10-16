@@ -273,6 +273,8 @@ else:
     'sky.server.auth.db_lookup',
     'sky.server.config',
     'sky.server.daemons',
+    'sky.users.rbac',
+    'sky.users.resolver',
 ])
 def test_module_imports_first_in_a_fresh_interpreter(module, tmp_path):
     """Each module imports cleanly as the first import of a process.
