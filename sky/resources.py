@@ -10,11 +10,11 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 import colorama
 
 from sky import catalog
-from sky import check as sky_check
 from sky import clouds
 from sky import exceptions
 from sky import sky_logging
 from sky import skypilot_config
+from sky.adaptors import common as adaptors_common
 from sky.clouds import cloud as sky_cloud
 from sky.provision import docker_utils
 from sky.provision.gcp import constants as gcp_constants
@@ -35,7 +35,13 @@ from sky.utils import schemas
 from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
+    from sky import check as sky_check
     from sky.utils import volume as volume_lib
+else:
+    # Lazy: sky.check imports cloud adaptors that import sky.clouds, whose
+    # cloud modules (via sky.provision) import this module, so a top-level
+    # import is circular. Used only at runtime.
+    sky_check = adaptors_common.LazyImport('sky.check')
 
 logger = sky_logging.init_logger(__name__)
 

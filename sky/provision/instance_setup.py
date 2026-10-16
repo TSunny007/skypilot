@@ -15,7 +15,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from sky import exceptions
 from sky import logs
 from sky import provision
-from sky import resources as resources_lib
 from sky import sky_logging
 from sky import skypilot_config
 from sky.provision import common
@@ -34,6 +33,9 @@ from sky.utils import source_utils
 from sky.utils import subprocess_utils
 from sky.utils import timeline
 from sky.utils import ux_utils
+
+# Used only in a quoted annotation (see start_skylet_on_head_node).
+from sky import resources as resources_lib  # isort: skip  # pylint: disable=unused-import
 
 logger = sky_logging.init_logger(__name__)
 
@@ -807,9 +809,13 @@ def start_ray_on_worker_nodes(cluster_name: str, no_restart: bool,
 @_auto_retry()
 @timeline.event
 def start_skylet_on_head_node(
-        cluster_name: resources_utils.ClusterName,
-        cluster_info: common.ClusterInfo, ssh_credentials: Dict[str, Any],
-        launched_resources: resources_lib.Resources) -> None:
+    cluster_name: resources_utils.ClusterName,
+    cluster_info: common.ClusterInfo,
+    ssh_credentials: Dict[str, Any],
+    # Quoted: this module is imported (via sky.clouds.kubernetes) while
+    # sky.resources may only be partially initialized.
+    launched_resources: 'resources_lib.Resources'
+) -> None:
     """Start skylet on the head node."""
     # Avoid circular import.
     # pylint: disable=import-outside-toplevel
