@@ -226,7 +226,12 @@ class TestCopyFileAtomically:
 def _handle():
     handle = cloud_vm_ray_backend.CloudVmRayResourceHandle.__new__(
         cloud_vm_ray_backend.CloudVmRayResourceHandle)
-    handle.launched_resources = mock.Mock()
+    launched_resources = mock.Mock()
+    # A plain Mock refuses to read `assert*` attributes; the code under test
+    # calls launched_resources.assert_launchable().cloud.
+    launched_resources.assert_launchable = mock.Mock(
+        return_value=launched_resources)
+    handle.launched_resources = launched_resources
     return handle
 
 
