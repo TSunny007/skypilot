@@ -2789,6 +2789,18 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                  f'{[pod.metadata.name for pod in pods]}')
 
     assert head_pod_name is not None, 'head_instance_id should not be None'
+    runtime_metadata = common.ProvisionRuntimeMetadata()
+    if config.provider_config.get('fast_start') and not running_pods:
+        # Every pod is new and starts the job itself: each writes its
+        # per-node setup script and the head registers and queues the job
+        # (kubernetes/fast_start.py). The host still does the runtime setup
+        # (credentials, wheel, skylet) and the workdir / file-mount sync, so
+        # those flags stay False. Pods that already existed (a relaunch onto
+        # the cluster) carry no new job, so that launch takes the regular path.
+        runtime_metadata = common.ProvisionRuntimeMetadata(
+            setup_done=True,
+            run_started=True,
+        )
     return common.ProvisionRecord(
         provider_name='kubernetes',
         region=region,
@@ -2797,6 +2809,7 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         head_instance_id=head_pod_name,
         resumed_instance_ids=[],
         created_instance_ids=list(created_pods.keys()),
+        runtime_metadata=runtime_metadata,
     )
 
 
