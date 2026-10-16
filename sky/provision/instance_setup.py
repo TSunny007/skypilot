@@ -377,16 +377,17 @@ RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND = (
 # APIs of SkyPilot's pinned Ray (2.9.3): any failure other than "not up yet"
 # makes the caller fall back to RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND.
 # Prints the ray_port payload (as RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND does),
-# then the alive nodes' IPs; exits RAY_GCS_NOT_UP_EXIT_CODE when Ray is not
-# installed or the GCS is not reachable yet.
+# then the alive nodes' IPs; exits RAY_GCS_NOT_UP_EXIT_CODE only when the GCS
+# is not reachable (yet). Ray not importable by SKY_PYTHON_CMD is a plain
+# failure, so the caller falls back to `ray status` (which runs on the same
+# interpreter): on Kubernetes the pod writes python_path and installs Ray
+# before its STEP 2 marker, which the provisioner's runtime setup waits on.
 RAY_GCS_NOT_UP_EXIT_CODE = 3
 _RAY_ALIVE_NODES_TAG = 'sky-ray-alive-nodes'
 _RAY_ALIVE_NODES_PATTERN = re.compile(
     f'<{_RAY_ALIVE_NODES_TAG}>(.*?)</{_RAY_ALIVE_NODES_TAG}>')
 _RAY_ALIVE_NODES_PY = (
-    'import importlib.util, json, sys; '
-    'importlib.util.find_spec(\'ray\') or '
-    f'sys.exit({RAY_GCS_NOT_UP_EXIT_CODE}); '
+    'import json, sys; '
     'import ray._raylet as r; '
     'a = \'127.0.0.1:\' + sys.argv[1]; '
     f'r.check_health(a) or sys.exit({RAY_GCS_NOT_UP_EXIT_CODE}); '

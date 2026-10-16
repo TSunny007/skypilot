@@ -202,11 +202,14 @@ def test_live_snippet_reports_gcs_not_up(tmp_path):
     assert proc.returncode == instance_setup.RAY_GCS_NOT_UP_EXIT_CODE
 
 
-def test_live_snippet_reports_not_up_without_ray(tmp_path):
-    # Ray not installed yet (custom image mid-bootstrap) is "not up", not an
-    # unsupported API -- otherwise the wait would give up on the live query.
+def test_live_snippet_without_ray_is_a_failure_not_not_up(tmp_path):
+    # Ray not importable by the runtime python must not read as "Ray not up
+    # yet" -- the wait would then never see the cluster and restart Ray at
+    # its timeout. As a plain failure, the provisioner falls back to
+    # `ray status` instead.
     proc = _run_live_snippet(tmp_path, gcs_up=True, with_ray=False)
-    assert proc.returncode == instance_setup.RAY_GCS_NOT_UP_EXIT_CODE
+    assert proc.returncode not in (0, instance_setup.RAY_GCS_NOT_UP_EXIT_CODE)
+    assert instance_setup.parse_ray_alive_nodes(proc.stdout) is None
 
 
 def test_live_command_quotes_survive_bash():
