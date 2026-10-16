@@ -49,6 +49,25 @@ from sky.utils import status_lib
 from sky.utils.plugin_extensions import LogDeliverySource
 
 
+@pytest.fixture(autouse=True)
+def _monitor_reads_status_via_get_job_status(monkeypatch):
+    """Route the monitor's status read through get_job_status.
+
+    The monitor reads the job status with get_job_status_and_end_time (which
+    folds in a terminal job's end time), while the tests here stub
+    get_job_status. Delegating to it, looked up at call time so that each
+    test's stub applies, keeps them driving the monitor. The folded end time
+    itself is covered by TestUserJobStatusClassification.
+    """
+
+    async def via_get_job_status(*args, **kwargs):
+        status, reason = await managed_job_utils.get_job_status(*args, **kwargs)
+        return status, None, reason
+
+    monkeypatch.setattr(managed_job_utils, 'get_job_status_and_end_time',
+                        via_get_job_status)
+
+
 class TestNormalJobRecovery:
     """Tests for normal (single task) job recovery during controller restart.
 
@@ -1810,6 +1829,59 @@ class TestUserJobStatusClassification:
         executor.should_restart_on_failure.assert_called_once()
         mock_set_failed.assert_called_once()
         return mock_set_failed
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('worker_job_status', [
+        job_lib.JobStatus.SUCCEEDED,
+        job_lib.JobStatus.FAILED,
+    ])
+    @pytest.mark.parametrize('folded_end_time', [777.0, None])
+    async def test_terminal_status_uses_folded_end_time(self, worker_job_status,
+                                                        folded_end_time):
+        """The end time read with the status saves the separate query.
+
+        Only when the status read did not fold it in (gRPC, a runtime plugin
+        or a head running an older SkyPilot) is the end time queried again.
+        """
+        controller = self._make_controller()
+        executor = MagicMock()
+        executor.should_restart_on_failure.return_value = False
+        executor.max_restarts_on_errors = 0
+        mock_task = MagicMock()
+        mock_task.name = 'test-task'
+        mock_task.num_nodes = 1
+        status_read = AsyncMock(return_value=(worker_job_status,
+                                              folded_end_time, None))
+
+        with patch('asyncio.sleep', new=AsyncMock()), \
+             patch('sky.backends.backend_utils.async_check_network_connection',
+                   new=AsyncMock()), \
+             patch.object(managed_job_utils, 'get_job_status_and_end_time',
+                          new=status_read), \
+             patch('sky.jobs.utils.try_to_get_job_end_time',
+                   return_value=12345.0) as end_time_query, \
+             patch('sky.backends.backend_utils.refresh_cluster_status_handle',
+                   return_value=(status_lib.ClusterStatus.UP, MagicMock())), \
+             patch('sky.backends.backend_utils.get_clusters',
+                   return_value=[]), \
+             patch('sky.jobs.state.set_succeeded_async',
+                   new=AsyncMock()) as set_succeeded, \
+             patch('sky.jobs.state.set_failed_async',
+                   new=AsyncMock()) as set_failed:
+            await controller._monitor_one_task(
+                task_id=0,
+                task=mock_task,
+                cluster_name='test-cluster',
+                executor=executor,
+                callback_func=MagicMock(),
+            )
+
+        expected = 12345.0 if folded_end_time is None else folded_end_time
+        set_state = (set_succeeded if worker_job_status
+                     == job_lib.JobStatus.SUCCEEDED else set_failed)
+        set_state.assert_called_once()
+        assert set_state.call_args.kwargs['end_time'] == expected
+        assert end_time_query.called == (folded_end_time is None)
 
     @pytest.mark.asyncio
     async def test_failed_driver_maps_to_failed_not_controller(self):
@@ -4011,3 +4083,132 @@ class TestJobGroupResumeWithFinishedPrimaries:
         for task in asyncio.all_tasks():
             if task is not asyncio.current_task():
                 task.cancel()
+
+
+class TestMonitorSchedule:
+    """How often the monitor checks a job, and when a multi-node tick also
+    refreshes the whole cluster."""
+
+    class _StopLoop(Exception):
+        """Sentinel to break the otherwise-infinite monitoring loop."""
+
+    async def _run(self,
+                   statuses,
+                   fresh_launch,
+                   clock,
+                   num_nodes=4,
+                   stop_at_refresh=False):
+        """Drive the loop through one status read per entry of statuses."""
+        task = MagicMock()
+        task.num_nodes = num_nodes
+        instance = MagicMock()
+        instance._job_id = 1
+        instance._pool = None
+        instance._update_live_log_links = AsyncMock(return_value=False)
+        reads = iter(statuses)
+        sleeps = []
+
+        async def fake_status(*args, **kwargs):
+            del args, kwargs
+            try:
+                return next(reads), None
+            except StopIteration:
+                raise TestMonitorSchedule._StopLoop() from None
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+            clock['t'] += seconds
+
+        def fake_refresh(*args, **kwargs):
+            del args, kwargs
+            if stop_at_refresh:
+                raise TestMonitorSchedule._StopLoop()
+            clock['t'] += 6
+            return status_lib.ClusterStatus.UP, MagicMock()
+
+        with patch.object(controller_module.time, 'monotonic',
+                          side_effect=lambda: clock['t']), \
+             patch.object(managed_job_utils, 'get_job_status',
+                          side_effect=fake_status), \
+             patch.object(controller_module.backend_utils,
+                          'refresh_cluster_status_handle',
+                          side_effect=fake_refresh) as refresh, \
+             patch.object(controller_module.backend_utils,
+                          'async_check_network_connection',
+                          new=AsyncMock(return_value=None)), \
+             patch.object(controller_module.managed_job_runtime,
+                          'is_registered', return_value=False), \
+             patch.object(controller_module.asyncio, 'sleep',
+                          side_effect=fake_sleep):
+            with pytest.raises(TestMonitorSchedule._StopLoop):
+                await JobController._monitor_one_task_impl(
+                    instance,
+                    task_id=0,
+                    task=task,
+                    cluster_name='cluster',
+                    executor=MagicMock(),
+                    status_logger=managed_job_utils.JobStatusLogger(),
+                    callback_func=AsyncMock(),
+                    fresh_launch=fresh_launch)
+        return sleeps, refresh, instance
+
+    @pytest.mark.asyncio
+    async def test_fresh_launch_checks_often_and_trusts_the_launch(self):
+        clock = {'t': 1000.0}
+        running = job_lib.JobStatus.RUNNING
+        sleeps, refresh, instance = await self._run([running] * 3,
+                                                    fresh_launch=True,
+                                                    clock=clock)
+        gap = controller_module._FRESH_LAUNCH_CHECK_GAP_SECONDS
+        # The fourth sleep precedes the read that ends the loop.
+        assert sleeps == [gap] * 4
+        # The launch just saw every node up: no full refresh, and no
+        # live-link scan holding up the next check.
+        refresh.assert_not_called()
+        instance._update_live_log_links.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fresh_checks_end_after_the_window(self):
+        clock = {'t': 1000.0}
+        window = controller_module._FRESH_LAUNCH_FAST_CHECK_SECONDS
+        gap = controller_module._FRESH_LAUNCH_CHECK_GAP_SECONDS
+        n_fast = window // gap
+        sleeps, _, _ = await self._run([job_lib.JobStatus.RUNNING] *
+                                       (n_fast + 1),
+                                       fresh_launch=True,
+                                       clock=clock)
+        assert sleeps[:n_fast] == [gap] * n_fast
+        assert sleeps[n_fast] > gap  # The usual cadence from here on.
+
+    @pytest.mark.asyncio
+    async def test_multi_node_refresh_runs_at_most_every_gap(self):
+        clock = {'t': 1000.0}
+        running = job_lib.JobStatus.RUNNING
+        # Not fresh (e.g. resumed): the first live tick refreshes; later
+        # ones only once _MULTI_NODE_REFRESH_GAP_SECONDS have passed.
+        sleeps, refresh, _ = await self._run([running] * 8,
+                                             fresh_launch=False,
+                                             clock=clock)
+        refresh_gap = controller_module._MULTI_NODE_REFRESH_GAP_SECONDS
+        elapsed = sum(sleeps) + 6 * refresh.call_count
+        assert 1 < refresh.call_count <= 1 + elapsed // refresh_gap
+
+    @pytest.mark.asyncio
+    async def test_single_node_never_refreshes_while_live(self):
+        clock = {'t': 1000.0}
+        _, refresh, _ = await self._run([job_lib.JobStatus.RUNNING] * 3,
+                                        fresh_launch=False,
+                                        clock=clock,
+                                        num_nodes=1)
+        refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_status_read_refreshes_at_once(self):
+        """Even right after a fresh launch, a status read that fails (e.g.
+        the head is gone) checks the cluster."""
+        clock = {'t': 1000.0}
+        _, refresh, _ = await self._run([None],
+                                        fresh_launch=True,
+                                        clock=clock,
+                                        stop_at_refresh=True)
+        refresh.assert_called_once()

@@ -1,4 +1,5 @@
 """Backend: runs on cloud virtual machines, managed by Ray."""
+import base64
 import copy
 import dataclasses
 import enum
@@ -20,6 +21,7 @@ import time
 import typing
 from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
                     Sequence, Set, Tuple, Union)
+import zlib
 
 import colorama
 import psutil
@@ -190,7 +192,7 @@ _MAX_GET_ZONE_RETRY = 3
 
 _JOB_ID_PATTERN = re.compile(r'Job ID: ([0-9]+)')
 _JOB_IDS_PATTERN = re.compile(r'Job IDs: ([0-9,]+)')
-_LOG_DIR_PATTERN = re.compile(r'Log Dir: ([^ ]+)')
+_LOG_DIR_PATTERN = re.compile(r'Log Dir: (\S+)')
 
 # Path to the monkey-patched ray up script.
 # We don't do import then __file__ because that script needs to be filled in
@@ -270,6 +272,19 @@ _CLUSTER_LOCK_TIMEOUT = 5.0
 # duration of the conflicting operation. This gap is the fallback reschedule
 # backoff when waiting on the lock condition fails (e.g. a database glitch).
 _CLUSTER_LOCK_RETRY_GAP_SECONDS = 30
+
+
+def _driver_submit_cmd(job_id: int, script_path: str,
+                       remote_log_path: str) -> str:
+    """The command the head's job scheduler runs to start a job's driver."""
+    return (
+        # JOB_CMD_IDENTIFIER is used for identifying the process
+        # retrieved with pid is the same driver process.
+        f'{job_lib.JOB_CMD_IDENTIFIER.format(job_id)} && '
+        f'{constants.SKY_PYTHON_CMD} -u {script_path}'
+        # Do not use &>, which is not POSIX and may not work.
+        # Note that the order of ">filename 2>&1" matters.
+        f'> {remote_log_path} 2>&1')
 
 
 def _is_message_too_long(returncode: int,
@@ -4344,14 +4359,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         mkdir_code = f'mkdir -p {remote_log_dir} && touch {remote_log_path}'
         encoded_script = shlex.quote(codegen)
         create_script_code = f'{{ echo {encoded_script} > {script_path}; }}'
-        job_submit_cmd = (
-            # JOB_CMD_IDENTIFIER is used for identifying the process
-            # retrieved with pid is the same driver process.
-            f'{job_lib.JOB_CMD_IDENTIFIER.format(job_id)} && '
-            f'{constants.SKY_PYTHON_CMD} -u {script_path}'
-            # Do not use &>, which is not POSIX and may not work.
-            # Note that the order of ">filename 2>&1" matters.
-            f'> {remote_log_path} 2>&1')
+        job_submit_cmd = _driver_submit_cmd(job_id, script_path,
+                                            remote_log_path)
         code = job_lib.JobLibCodeGen.queue_job(job_id, job_submit_cmd)
 
         # For Slurm, we need to wait for the job to complete before exiting,
@@ -4579,6 +4588,91 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                                  f'Returncode: {returncode}') from e
         return job_id, log_dir
 
+    def _add_and_queue_job(self, handle: CloudVmRayResourceHandle,
+                           task: task_lib.Task, resources_str: str,
+                           metadata: str) -> Optional[Tuple[int, str, bool]]:
+        """Add the job, and queue it in the same head round trip if possible.
+
+        On the SSH/codegen path, submitting a job otherwise takes four head
+        round trips: add_job, the remote home lookup and upload of a driver
+        too big to inline, then queue. On a cluster the jobs controller just
+        launched the job id is predictable (the first job on a new cluster is
+        1), so the driver is generated for it up front and sent inline,
+        compressed, with add_job. The head writes and queues it only if
+        add_job returns that id and log dir.
+
+        Returns:
+            None if not attempted, in which case the caller adds the job as
+            usual. Otherwise (job_id, log_dir, queued): the job was added,
+            and if it was not queued (the prediction missed, or the head runs
+            an older runtime) the caller submits it the usual way.
+        """
+        if (not self._is_launched_by_jobs_controller or
+                handle.is_grpc_enabled_with_flag or self._dump_final_script or
+                isinstance(handle.launched_resources.cloud, clouds.Slurm)):
+            return None
+        expected_job_id = 1
+        # Mirror the head's add_job, which names the log dir after the job.
+        job_name = '-' if task.name is None else task.name
+        expected_log_dir = os.path.join(constants.SKY_LOGS_DIRECTORY,
+                                        f'{expected_job_id}-{job_name}')
+        num_actual_nodes = task.num_nodes * handle.num_ips_per_node
+        driver = self._build_task_driver(handle, task, expected_job_id,
+                                         expected_log_dir,
+                                         max(num_actual_nodes, 1))
+        script_path = os.path.join(SKY_REMOTE_APP_DIR,
+                                   f'sky_job_{expected_job_id}')
+        code = job_lib.JobLibCodeGen.add_and_queue_job(
+            job_name=task.name,
+            username=common_utils.get_user_hash(),
+            run_timestamp=self.run_timestamp,
+            resources_str=resources_str,
+            metadata=metadata,
+            expected_job_id=expected_job_id,
+            expected_log_dir=expected_log_dir,
+            script_path=script_path,
+            compressed_driver=base64.b64encode(
+                zlib.compress(driver.encode('utf-8'))).decode('ascii'),
+            job_submit_cmd=_driver_submit_cmd(
+                expected_job_id, script_path,
+                os.path.join(expected_log_dir, 'run.log')))
+        head_runner = handle.get_command_runners()[0]
+        if head_runner.is_command_length_over_limit(code):
+            return None
+        returncode, stdout, stderr = self.run_on_head(handle,
+                                                      code,
+                                                      stream_logs=False,
+                                                      require_outputs=True,
+                                                      separate_stderr=True,
+                                                      head_runner=head_runner)
+        if _is_message_too_long(returncode, output=stdout + stderr):
+            # Refused for its size before it ran, so nothing was added.
+            return None
+        # Same checks as _add_job, then _exec_code_on_head.
+        backend_utils.check_stale_runtime_on_remote(returncode, stderr,
+                                                    handle.cluster_name)
+        job_id_match = _JOB_ID_PATTERN.search(stdout)
+        subprocess_utils.handle_returncode(
+            returncode, code, 'Failed to fetch job id.'
+            if job_id_match is None else 'Failed to submit job.', stderr)
+        if job_id_match is None:
+            raise ValueError(f'Failed to parse job id: {stdout}; '
+                             f'Returncode: {returncode}')
+        job_id = int(job_id_match.group(1))
+        log_dir_match = _LOG_DIR_PATTERN.search(stdout)
+        log_dir = (log_dir_match.group(1).strip()
+                   if log_dir_match is not None else self.log_dir)
+        queued = f'Job queued: {job_id}' in stdout
+        if queued:
+            logger.info(
+                ux_utils.starting_message(f'Job submitted, ID: {job_id}'))
+            rich_utils.stop_safe_status()
+        else:
+            logger.debug(f'Job {job_id} ({log_dir}) was added but not queued '
+                         f'(expected job {expected_job_id} in '
+                         f'{expected_log_dir}); submitting it separately.')
+        return job_id, log_dir, queued
+
     def set_job_info_without_job_id(
         self,
         handle: CloudVmRayResourceHandle,
@@ -4728,16 +4822,23 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             logger.info(f'Dryrun complete. Would have run:\n{task}')
             return None
 
-        job_id, log_dir = self._add_job(handle, task_copy.name, resources_str,
+        added = self._add_and_queue_job(handle, task_copy, resources_str,
                                         task.metadata_json)
-
-        num_actual_nodes = task.num_nodes * handle.num_ips_per_node
-        # Case: task_lib.Task(run, num_nodes=N) or TPU VM Pods
-        if num_actual_nodes > 1:
-            self._execute_task_n_nodes(handle, task_copy, job_id, log_dir)
+        if added is None:
+            job_id, log_dir = self._add_job(handle, task_copy.name,
+                                            resources_str, task.metadata_json)
+            queued = False
         else:
-            # Case: task_lib.Task(run, num_nodes=1)
-            self._execute_task_one_node(handle, task_copy, job_id, log_dir)
+            job_id, log_dir, queued = added
+
+        if not queued:
+            num_actual_nodes = task.num_nodes * handle.num_ips_per_node
+            # Case: task_lib.Task(run, num_nodes=N) or TPU VM Pods
+            if num_actual_nodes > 1:
+                self._execute_task_n_nodes(handle, task_copy, job_id, log_dir)
+            else:
+                # Case: task_lib.Task(run, num_nodes=1)
+                self._execute_task_one_node(handle, task_copy, job_id, log_dir)
 
         # After the job is submitted: recording is best-effort and nothing
         # reads the spec before now, so it must not delay the job's start.
@@ -4927,6 +5028,54 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             )
         statuses = job_lib.load_statuses_payload(stdout)
         return statuses
+
+    def get_job_status_with_end_time(
+        self,
+        handle: CloudVmRayResourceHandle,
+        job_id: Optional[int],
+        stream_logs: bool = False,
+    ) -> Tuple[Optional[job_lib.JobStatus], Optional[float]]:
+        """The status of one job (the latest if None), plus its end time.
+
+        On the SSH/codegen path the end time of a terminal job comes back in
+        the same head round trip as the status, which saves the jobs
+        controller the separate end-time query it otherwise makes once the
+        job finishes. The end time is None when the job is not terminal, the
+        head runs an older SkyPilot, or on gRPC, where the separate end-time
+        RPC is cheap and stays as it is.
+        """
+        job_ids = None if job_id is None else [job_id]
+        if handle.is_grpc_enabled_with_flag:
+            statuses = self.get_job_status(handle,
+                                           job_ids,
+                                           stream_logs=stream_logs)
+            return list(statuses.values())[0], None
+
+        code = job_lib.JobLibCodeGen.get_job_status_with_end_time(job_ids)
+        returncode, stdout, stderr = self.run_on_head(handle,
+                                                      code,
+                                                      stream_logs=stream_logs,
+                                                      require_outputs=True,
+                                                      separate_stderr=True)
+        subprocess_utils.handle_returncode(returncode, code,
+                                           'Failed to get job status.', stderr)
+        if not stdout:
+            # Same guard as get_job_status: a misbehaving cluster/k8s
+            # apiserver can return 0 with an empty stdout.
+            raise exceptions.CommandFailureException(
+                command=code,
+                failure='produced no output',
+                error_msg='Failed to get job status.',
+                detailed_reason=f'stderr="{stderr}"',
+            )
+        # The untyped decode returns the first payload in the output, which
+        # is the statuses payload; the end time is picked out by its type.
+        statuses = job_lib.load_statuses_payload(stdout)
+        matched, end_time = message_utils.decode_payload(
+            stdout, payload_type='job-end-time', raise_for_mismatch=False)
+        if not matched or end_time is None:
+            return list(statuses.values())[0], None
+        return list(statuses.values())[0], float(end_time)
 
     def get_job_metadata(
         self,
@@ -7180,50 +7329,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             resources_dict['CPU'] = float(requested_cpus.rstrip('+'))
         return resources_dict
 
-    def _execute_task_one_node(self, handle: CloudVmRayResourceHandle,
-                               task: task_lib.Task, job_id: int,
-                               remote_log_dir: str) -> None:
-        # Launch the command as a Ray task.
-        log_dir = os.path.join(remote_log_dir, 'tasks')
-        resources_dict = self._get_task_demands_dict(handle, task)
-        internal_ips = handle.internal_ips()
-        assert internal_ips is not None, 'internal_ips is not cached in handle'
-
-        task_env_vars = self._get_task_env_vars(task, job_id, handle)
-
-        codegen = self._get_task_codegen_class(handle)
-
-        codegen.add_prologue(job_id)
-        codegen.add_setup(
-            1,
-            resources_dict,
-            stable_cluster_internal_ips=internal_ips,
-            env_vars=task_env_vars,
-            log_dir=log_dir,
-            setup_cmd=self._setup_cmd,
-        )
-
-        codegen.add_task(1,
-                         bash_script=task.run,
-                         env_vars=task_env_vars,
-                         task_name=task.name,
-                         resources_dict=self._get_task_demands_dict(
-                             handle, task),
-                         log_dir=log_dir)
-
-        codegen.add_epilogue()
-
-        self._exec_code_on_head(
-            handle,
-            codegen.build(),
-            job_id,
-            managed_job_dag=task.managed_job_dag,
-            managed_job_user_id=self._get_managed_job_user_id(task),
-            remote_log_dir=remote_log_dir)
-
-    def _execute_task_n_nodes(self, handle: CloudVmRayResourceHandle,
-                              task: task_lib.Task, job_id: int,
-                              remote_log_dir: str) -> None:
+    def _build_task_driver(self, handle: CloudVmRayResourceHandle,
+                           task: task_lib.Task, job_id: int,
+                           remote_log_dir: str, num_nodes: int) -> str:
+        """The driver program that runs the task on num_nodes nodes."""
         # Strategy:
         #   ray.init(...)
         #   for node:
@@ -7233,15 +7342,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         internal_ips = handle.internal_ips()
         assert internal_ips is not None, 'internal_ips is not cached in handle'
 
-        # If TPU VM Pods is used, #num_nodes should be num_nodes * num_node_ips
-        num_actual_nodes = task.num_nodes * handle.num_ips_per_node
         task_env_vars = self._get_task_env_vars(task, job_id, handle)
 
         codegen = self._get_task_codegen_class(handle)
 
         codegen.add_prologue(job_id)
         codegen.add_setup(
-            num_actual_nodes,
+            num_nodes,
             resources_dict,
             stable_cluster_internal_ips=internal_ips,
             env_vars=task_env_vars,
@@ -7249,7 +7356,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             setup_cmd=self._setup_cmd,
         )
 
-        codegen.add_task(num_actual_nodes,
+        codegen.add_task(num_nodes,
                          bash_script=task.run,
                          env_vars=task_env_vars,
                          task_name=task.name,
@@ -7258,10 +7365,30 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                          log_dir=log_dir)
 
         codegen.add_epilogue()
+        return codegen.build()
+
+    def _execute_task_one_node(self, handle: CloudVmRayResourceHandle,
+                               task: task_lib.Task, job_id: int,
+                               remote_log_dir: str) -> None:
+        # Launch the command as a Ray task.
+        self._exec_code_on_head(
+            handle,
+            self._build_task_driver(handle, task, job_id, remote_log_dir, 1),
+            job_id,
+            managed_job_dag=task.managed_job_dag,
+            managed_job_user_id=self._get_managed_job_user_id(task),
+            remote_log_dir=remote_log_dir)
+
+    def _execute_task_n_nodes(self, handle: CloudVmRayResourceHandle,
+                              task: task_lib.Task, job_id: int,
+                              remote_log_dir: str) -> None:
+        # If TPU VM Pods is used, #num_nodes should be num_nodes * num_node_ips
+        num_actual_nodes = task.num_nodes * handle.num_ips_per_node
         # TODO(zhanghao): Add help info for downloading logs.
         self._exec_code_on_head(
             handle,
-            codegen.build(),
+            self._build_task_driver(handle, task, job_id, remote_log_dir,
+                                    num_actual_nodes),
             job_id,
             managed_job_dag=task.managed_job_dag,
             managed_job_user_id=self._get_managed_job_user_id(task),

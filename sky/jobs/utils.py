@@ -754,6 +754,54 @@ async def get_job_status(
         transient_error_reason: None if successful or fatal error; otherwise,
             the detailed reason for the transient error.
     """
+    status, _, transient_error_reason = await _get_job_status_impl(
+        backend,
+        cluster_name,
+        job_id,
+        status_logger,
+        handle=handle,
+        runtime_checked=runtime_checked,
+        fetch_end_time=False)
+    return status, transient_error_reason
+
+
+async def get_job_status_and_end_time(
+    backend: 'backends.CloudVmRayBackend',
+    cluster_name: str,
+    job_id: Optional[int],
+    status_logger: Optional[JobStatusLogger] = None,
+    *,
+    handle: Optional['backends.CloudVmRayResourceHandle'] = None,
+    runtime_checked: bool = False,
+) -> Tuple[Optional['job_lib.JobStatus'], Optional[float], Optional[str]]:
+    """get_job_status, plus the job's end time when the status read has it.
+
+    On the SSH/codegen path the end time of a terminal job is read in the
+    same round trip as the status, saving a second query. In every other
+    case (gRPC, a registered runtime plugin, a head running an older
+    SkyPilot, the job not being terminal yet, or a fetch failure) the end
+    time is None and the caller falls back to try_to_get_job_end_time.
+    """
+    return await _get_job_status_impl(backend,
+                                      cluster_name,
+                                      job_id,
+                                      status_logger,
+                                      handle=handle,
+                                      runtime_checked=runtime_checked,
+                                      fetch_end_time=True)
+
+
+async def _get_job_status_impl(
+    backend: 'backends.CloudVmRayBackend',
+    cluster_name: str,
+    job_id: Optional[int],
+    status_logger: Optional[JobStatusLogger] = None,
+    *,
+    handle: Optional['backends.CloudVmRayResourceHandle'] = None,
+    runtime_checked: bool = False,
+    fetch_end_time: bool,
+) -> Tuple[Optional['job_lib.JobStatus'], Optional[float], Optional[str]]:
+    """Shared implementation of get_job_status(/_and_end_time)."""
     # TODO(zhwu, cooperc): Make this get job status aware of cluster status, so
     # that it can exit retry early if the cluster is down.
     # TODO(luca) make this async
@@ -776,25 +824,36 @@ async def get_job_status(
         if result is not None:
             status, _ = result
             _log_job_status(status)
-            return result
+            return status, None, result[1]
 
     if handle is None:
         # This can happen if the cluster was preempted and background status
         # refresh already noticed and cleaned it up.
         _log(f'Cluster {cluster_name} not found.')
-        return None, None
+        return None, None, None
     assert isinstance(handle, backends.CloudVmRayResourceHandle), handle
     job_ids = None if job_id is None else [job_id]
     try:
-        statuses = await asyncio.wait_for(
-            asyncio.to_thread(backend.get_job_status,
-                              handle,
-                              job_ids=job_ids,
-                              stream_logs=False),
-            timeout=_JOB_STATUS_FETCH_TIMEOUT_SECONDS)
-        status = list(statuses.values())[0]
+        end_time: Optional[float] = None
+        # With a runtime plugin registered, its get_job_ended_at owns the end
+        # time (see try_to_get_job_end_time), so do not fold it in here.
+        if fetch_end_time and not managed_job_runtime.is_registered():
+            status, end_time = await asyncio.wait_for(
+                asyncio.to_thread(backend.get_job_status_with_end_time,
+                                  handle,
+                                  job_id,
+                                  stream_logs=False),
+                timeout=_JOB_STATUS_FETCH_TIMEOUT_SECONDS)
+        else:
+            statuses = await asyncio.wait_for(
+                asyncio.to_thread(backend.get_job_status,
+                                  handle,
+                                  job_ids=job_ids,
+                                  stream_logs=False),
+                timeout=_JOB_STATUS_FETCH_TIMEOUT_SECONDS)
+            status = list(statuses.values())[0]
         _log_job_status(status)
-        return status, None
+        return status, end_time, None
     except (exceptions.CommandError, exceptions.CommandFailureException,
             grpc.RpcError, grpc.FutureTimeoutError, ValueError, TypeError,
             asyncio.TimeoutError) as e:
@@ -844,7 +903,7 @@ async def get_job_status(
                                                     'already cleaned up')
             else:
                 raise
-        return None, potential_transient_error_reason
+        return None, None, potential_transient_error_reason
 
 
 def controller_process_alive(record: managed_job_state.ControllerPidRecord,

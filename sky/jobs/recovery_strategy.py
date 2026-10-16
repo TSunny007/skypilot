@@ -11,9 +11,11 @@ import contextlib
 import logging
 import os
 import re
+import time
 import traceback
 import typing
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple
+from typing import (Any, Callable, Coroutine, Dict, List, NamedTuple, Optional,
+                    Set, Tuple)
 
 from sky import backends
 from sky import dag as dag_lib
@@ -210,6 +212,34 @@ def _error_kind(e: BaseException) -> str:
     return type(e).__name__
 
 
+class _FreshSubmission(NamedTuple):
+    """A job that the launch (or exec) request which just completed queued.
+
+    A launch request only returns a cluster job id after it has added the job
+    to the cluster's job table and queued it, so at that moment the job is
+    past INIT, which is all _wait_until_job_starts_on_cluster checks for.
+    """
+    job_id: int
+    # Controller wall-clock time at which the request completed.
+    completed_at: float
+
+
+def _fresh_submission_from_result(result: Any) -> Optional[_FreshSubmission]:
+    """The job a launch request that just completed submitted, if any.
+
+    The result is ``(job_id, handle)``, or ``(job_id, handle, credentials)``
+    for callers that opted in to credentials (see decoders.decode_launch).
+    The job id is None when the request did not submit a job.
+    """
+    if not isinstance(result, tuple) or not result:
+        return None
+    job_id = result[0]
+    # bool is an int subclass; never treat True/False as a job id.
+    if not isinstance(job_id, int) or isinstance(job_id, bool):
+        return None
+    return _FreshSubmission(job_id=job_id, completed_at=time.time())
+
+
 def _consume_task_exception(task: 'asyncio.Future') -> None:
     """Consume a finished task's exception to avoid asyncio warnings."""
     if task.cancelled():
@@ -245,6 +275,12 @@ class StrategyExecutor:
     """Handle the launching, recovery and termination of managed job clusters"""
 
     RETRY_INIT_GAP_SECONDS = 60
+
+    # Set by _launch when the request that just completed submitted the job
+    # and the result can be trusted without re-verifying it on the cluster
+    # (see _launch); consumed by _wait_until_job_starts_on_cluster. A class
+    # default so that it is always defined.
+    _fresh_submission: Optional[_FreshSubmission] = None
 
     def __init__(
         self,
@@ -562,6 +598,21 @@ class StrategyExecutor:
             rather than record an opaque failure.
         """
         assert self.cluster_name is not None
+        fresh_submission = self._fresh_submission
+        # Consume it: it describes only the request that just completed.
+        self._fresh_submission = None
+        if (fresh_submission is not None and
+                not managed_job_runtime.is_registered()):
+            # The first launch just queued the job on the cluster, so the job
+            # is past INIT. Re-verifying it here would cost four head round
+            # trips (a forced status refresh, the job status and the submit
+            # time), each several seconds on Kubernetes, and only delay
+            # RUNNING. A preemption since then is caught by the monitor's
+            # first status check, as for any running job.
+            logger.info(f'Job {fresh_submission.job_id} was submitted to '
+                        f'{self.cluster_name} by the launch that just '
+                        'completed. Skipping the job start check.')
+            return fresh_submission.completed_at, None
         status = None
         reason: Optional[str] = None
         job_checking_retry_cnt = 0
@@ -803,7 +854,7 @@ class StrategyExecutor:
                                                      _stream_and_get)
 
     async def _await_launch_request(self, request_id: str,
-                                    stream_task: 'asyncio.Future') -> None:
+                                    stream_task: 'asyncio.Future') -> Any:
         """Wait for the inner launch request, detecting if it parks.
 
         While waiting on the request's log stream (started by
@@ -820,6 +871,9 @@ class StrategyExecutor:
         while the request is WAITING, so the same stream picks up where it
         left off, with no reconnect and no replayed log lines.
 
+        Returns:
+            The result of the launch request.
+
         Raises:
             _LaunchRequestParked: The request was parked as WAITING.
             Exception: Any exception raised by the launch request itself.
@@ -829,8 +883,7 @@ class StrategyExecutor:
                 {stream_task}, timeout=_LAUNCH_REQUEST_STATUS_POLL_SECONDS)
             if done:
                 # Surface the exception of the request, if any.
-                stream_task.result()
-                return
+                return stream_task.result()
             try:
                 request_payload = await self._get_request_payload(request_id)
             except Exception as e:  # pylint: disable=broad-except
@@ -999,6 +1052,10 @@ class StrategyExecutor:
             # The stream future of this attempt's launch request; assigned in
             # the inner try below, referenced by the park handler.
             stream_task: Optional['asyncio.Future'] = None
+            # The job this attempt's launch/exec request submitted, if it
+            # returned one. Reset every iteration, like retry_code.
+            submitted_job: Optional[_FreshSubmission] = None
+            self._fresh_submission = None
             try:
                 if parked_request_id is not None:
                     resuming_from_park = True
@@ -1201,8 +1258,11 @@ class StrategyExecutor:
                                                 ).create_future())
                                             stream_task.set_result(result)
                                 assert stream_task is not None
-                                await self._await_launch_request(
-                                    request_id, stream_task)
+                                launch_result = (await
+                                                 self._await_launch_request(
+                                                     request_id, stream_task))
+                                submitted_job = _fresh_submission_from_result(
+                                    launch_result)
                             except asyncio.CancelledError:
                                 if request_id:
                                     await self._cancel_launch_request(request_id
@@ -1257,6 +1317,9 @@ class StrategyExecutor:
                             assert job_id_on_pool_cluster is not None, (
                                 self.cluster_name, self.job_id)
                             self.job_id_on_pool_cluster = job_id_on_pool_cluster
+                            submitted_job = _FreshSubmission(
+                                job_id=job_id_on_pool_cluster,
+                                completed_at=time.time())
                             await state.set_job_id_on_pool_cluster_async(
                                 self.job_id, job_id_on_pool_cluster)
                         logger.info('Managed job cluster launched.')
@@ -1389,6 +1452,13 @@ class StrategyExecutor:
                             else:
                                 logger.debug('Not populating instance links '
                                              'since the cluster name is None')
+                        # Trust the request that just completed only on the
+                        # first attempt of the first launch. A retry follows a
+                        # failure on this cluster, and a recovery a preemption
+                        # or failure, so both keep the full check, which also
+                        # refreshes the cluster status.
+                        if not recovery and retry_cnt == 1:
+                            self._fresh_submission = submitted_job
                         job_submitted_at, submit_reason = await (
                             self._wait_until_job_starts_on_cluster())
                         if job_submitted_at is not None:
