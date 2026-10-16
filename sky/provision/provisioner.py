@@ -31,6 +31,7 @@ from sky.provision import instance_setup
 from sky.provision import logging as provision_logging
 from sky.provision import metadata_utils
 from sky.provision import volume as provision_volume
+from sky.provision.kubernetes import fast_start as k8s_fast_start
 from sky.skylet import constants
 from sky.utils import common
 from sky.utils import common_utils
@@ -772,6 +773,19 @@ def _post_provision_setup(
                                                 **ssh_credentials)
         head_runner = runners[0]
 
+        # New pods that start their job themselves (kubernetes.fast_start).
+        fast_start_pods = (provider_config is not None and
+                           bool(provider_config.get('fast_start')) and
+                           provision_record.runtime_metadata.run_started)
+        if fast_start_pods:
+            # Every node has the wheel now; the head may queue the job.
+            returncode = head_runner.run(k8s_fast_start.runtime_ready_command(),
+                                         stream_logs=False)
+            if returncode:
+                raise RuntimeError(
+                    'fast_start: failed to signal the head pod that the '
+                    f'runtime is ready (exit code {returncode}).')
+
         def is_ray_cluster_healthy(ray_status_output: str,
                                    expected_num_nodes: int) -> bool:
             """Parse the output of `ray status` to get #active nodes.
@@ -826,8 +840,15 @@ def _post_provision_setup(
         ray_port = constants.SKY_REMOTE_RAY_PORT
         head_ray_needs_restart = True
         ray_cluster_healthy = False
-        if (launched_resources.cloud is not None and
-                not launched_resources.cloud.uses_ray()):
+        if fast_start_pods:
+            # The pods started Ray themselves at container start and the head
+            # submits the job once it is up (kubernetes/fast_start.py), so
+            # there is nothing to wait for or restart here.
+            skip_ray_setup = True
+            logger.debug('Skip Ray cluster setup: pods start it themselves '
+                         '(fast_start).')
+        elif (launched_resources.cloud is not None and
+              not launched_resources.cloud.uses_ray()):
             skip_ray_setup = True
             logger.debug('Skip Ray cluster setup as cloud does not use Ray.')
         elif (not provision_record.is_instance_just_booted(

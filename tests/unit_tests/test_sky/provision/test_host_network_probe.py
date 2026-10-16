@@ -97,14 +97,22 @@ class TestRayStartCommands:
         assert '--mode worker' not in guard
 
     def test_restarting_worker_still_probes_unconditionally(self):
-        """Without no_restart the command runs `ray stop` first, so the
-        ports really are free and the assertion is meaningful. Moving the
-        probe for the guarded case must not disarm it here."""
+        """The probe runs unconditionally: on a fresh pod `ray stop` is
+        skipped (no stale session can exist), so only the probe guarantees
+        the assigned ports really are free and the assertion is meaningful.
+        Moving the probe for the guarded case must not disarm it here.
+
+        Asserted structurally: the probe must sit before (outside) the
+        stale-session `|| { ... }` guard that now holds `ray stop`.
+        """
         cmd = instance_setup.ray_worker_start_command(custom_resource=None,
                                                       custom_ray_options=None,
                                                       no_restart=False)
         assert '--mode worker' in cmd
-        assert '|| {' not in cmd
+        prefix, _, guarded = cmd.partition('|| {')
+        assert guarded, 'expected the stale-session guard around `ray stop`'
+        assert 'ray' in guarded and 'stop' in guarded
+        assert '--mode worker' in prefix
 
     def test_probe_command_has_no_unencoded_newlines(self):
         # Newlines in the bash command land at column 0 of the rendered
