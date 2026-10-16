@@ -4928,6 +4928,54 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         statuses = job_lib.load_statuses_payload(stdout)
         return statuses
 
+    def get_job_status_with_end_time(
+        self,
+        handle: CloudVmRayResourceHandle,
+        job_id: Optional[int],
+        stream_logs: bool = False,
+    ) -> Tuple[Optional[job_lib.JobStatus], Optional[float]]:
+        """The status of one job (the latest if None), plus its end time.
+
+        On the SSH/codegen path the end time of a terminal job comes back in
+        the same head round trip as the status, which saves the jobs
+        controller the separate end-time query it otherwise makes once the
+        job finishes. The end time is None when the job is not terminal, the
+        head runs an older SkyPilot, or on gRPC, where the separate end-time
+        RPC is cheap and stays as it is.
+        """
+        job_ids = None if job_id is None else [job_id]
+        if handle.is_grpc_enabled_with_flag:
+            statuses = self.get_job_status(handle,
+                                           job_ids,
+                                           stream_logs=stream_logs)
+            return list(statuses.values())[0], None
+
+        code = job_lib.JobLibCodeGen.get_job_status_with_end_time(job_ids)
+        returncode, stdout, stderr = self.run_on_head(handle,
+                                                      code,
+                                                      stream_logs=stream_logs,
+                                                      require_outputs=True,
+                                                      separate_stderr=True)
+        subprocess_utils.handle_returncode(returncode, code,
+                                           'Failed to get job status.', stderr)
+        if not stdout:
+            # Same guard as get_job_status: a misbehaving cluster/k8s
+            # apiserver can return 0 with an empty stdout.
+            raise exceptions.CommandFailureException(
+                command=code,
+                failure='produced no output',
+                error_msg='Failed to get job status.',
+                detailed_reason=f'stderr="{stderr}"',
+            )
+        # The untyped decode returns the first payload in the output, which
+        # is the statuses payload; the end time is picked out by its type.
+        statuses = job_lib.load_statuses_payload(stdout)
+        matched, end_time = message_utils.decode_payload(
+            stdout, payload_type='job-end-time', raise_for_mismatch=False)
+        if not matched or end_time is None:
+            return list(statuses.values())[0], None
+        return list(statuses.values())[0], float(end_time)
+
     def get_job_metadata(
         self,
         handle: CloudVmRayResourceHandle,

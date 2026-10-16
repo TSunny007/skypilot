@@ -1359,6 +1359,10 @@ class JobController:
             # Get job status (skip on first iteration if forcing recovery)
             job_status = None
             transient_job_check_error_reason = None
+            # The job's end time folded into the status read when the job was
+            # already terminal (SSH/codegen path only); the terminal branches
+            # below skip the separate end-time query when it is set.
+            end_time_from_status: Optional[float] = None
             # Per-node exit codes of the failed run, populated only when
             # recovery is triggered by a job failure (not an infra-level
             # failure like preemption). Reset each iteration so a stale
@@ -1424,14 +1428,15 @@ class JobController:
                 # A failed status fetch leaves job_status=None; the checks
                 # below distinguish transient errors from recovery conditions.
                 try:
-                    job_status, transient_job_check_error_reason = (
-                        await managed_job_utils.get_job_status(
-                            self._backend,
-                            cluster_name,
-                            job_id=job_id_on_pool_cluster,
-                            status_logger=status_logger,
-                            handle=runtime_handle,
-                        ))
+                    (job_status, end_time_from_status,
+                     transient_job_check_error_reason) = (
+                         await managed_job_utils.get_job_status_and_end_time(
+                             self._backend,
+                             cluster_name,
+                             job_id=job_id_on_pool_cluster,
+                             status_logger=status_logger,
+                             handle=runtime_handle,
+                         ))
                 except exceptions.FetchClusterInfoError as fetch_e:
                     status_logger.reset()
                     logger.info(
@@ -1522,9 +1527,13 @@ class JobController:
             if job_status == job_lib.JobStatus.SUCCEEDED:
                 logger.info(f'Task {task_id} succeeded! '
                             'Getting end time and cleaning up')
-                success_end_time = await asyncio.to_thread(
-                    managed_job_utils.try_to_get_job_end_time, self._backend,
-                    cluster_name, job_id_on_pool_cluster)
+                success_end_time = end_time_from_status
+                if success_end_time is None:
+                    # The status read did not fold in the end time (gRPC
+                    # path, runtime plugin, or an old cluster).
+                    success_end_time = await asyncio.to_thread(
+                        managed_job_utils.try_to_get_job_end_time,
+                        self._backend, cluster_name, job_id_on_pool_cluster)
 
                 # The job is done. Set the job to SUCCEEDED first before start
                 # downloading and streaming the logs to make it more responsive.
@@ -1711,9 +1720,13 @@ class JobController:
                     # The user code has probably crashed, fail immediately.
                     logger.info(
                         f'Task {task_id} failed with status: {job_status}')
-                    end_time = await asyncio.to_thread(
-                        managed_job_utils.try_to_get_job_end_time,
-                        self._backend, cluster_name, job_id_on_pool_cluster)
+                    end_time = end_time_from_status
+                    if end_time is None:
+                        # The status read did not fold in the end time (gRPC
+                        # path, runtime plugin, or an old cluster).
+                        end_time = await asyncio.to_thread(
+                            managed_job_utils.try_to_get_job_end_time,
+                            self._backend, cluster_name, job_id_on_pool_cluster)
                     logger.info(
                         f'The user job failed ({job_status}). Please check the '
                         'logs below.\n'
