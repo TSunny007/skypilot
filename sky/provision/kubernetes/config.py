@@ -8,12 +8,16 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from sky.adaptors import kubernetes
 from sky.provision import common
 from sky.provision.kubernetes import utils as kubernetes_utils
+from sky.utils import subprocess_utils
 from sky.utils import yaml_utils
 
 logger = logging.getLogger(__name__)
 
 # Timeout for deleting a Kubernetes resource (in seconds).
 DELETION_TIMEOUT = 90
+
+# Most services configured at once. A cluster has one per node plus one.
+_SERVICE_CONFIG_THREADS = 16
 
 
 def bootstrap_instances(
@@ -706,30 +710,51 @@ def _configure_services(namespace: str, context: Optional[str],
         elif service['metadata']['namespace'] != namespace:
             raise InvalidNamespaceError(service_field, namespace)
 
-        name = service['metadata']['name']
-        field_selector = f'metadata.name={name}'
-        services = (kubernetes.core_api(context).list_namespaced_service(
-            namespace, field_selector=field_selector).items)
-        if services:
-            assert len(services) == 1
-            existing_service = services[0]
-            # Convert to k8s object to compare
-            new_svc = kubernetes_utils.dict_to_k8s_object(service, 'V1Service')
-            if new_svc.spec.ports == existing_service.spec.ports:
-                logger.info('_configure_services: '
-                            f'{using_existing_msg("service", name)}')
-                return
-            else:
-                logger.info('_configure_services: '
-                            f'{updating_existing_msg("service", name)}')
-                kubernetes.core_api(context).patch_namespaced_service(
-                    name, namespace, service)
-        else:
-            logger.info(
-                f'_configure_services: {not_found_msg("service", name)}')
+    # One service per node plus the head's: each is a list and a create, so
+    # do them in parallel rather than one after another.
+    subprocess_utils.run_in_parallel(
+        lambda service: _configure_service(namespace, context, service),
+        services, _SERVICE_CONFIG_THREADS)
+
+
+def _configure_service(namespace: str, context: Optional[str],
+                       service: Dict[str, Any]) -> None:
+    """Creates the service, or updates it if it exists with other ports."""
+    name = service['metadata']['name']
+    field_selector = f'metadata.name={name}'
+    existing = (kubernetes.core_api(context).list_namespaced_service(
+        namespace, field_selector=field_selector).items)
+    if not existing:
+        logger.info(f'_configure_services: {not_found_msg("service", name)}')
+        try:
             kubernetes.core_api(context).create_namespaced_service(
                 namespace, service)
+        except kubernetes.api_exception() as e:
+            if e.status != 409:
+                raise
+            # Created by someone else since the list, e.g. a concurrent
+            # launch of the same cluster: compare it like one that was
+            # listed.
+            logger.info(f'_configure_services: service {name!r} was '
+                        'created concurrently.')
+            existing = [
+                kubernetes.core_api(context).read_namespaced_service(
+                    name, namespace)
+            ]
+        else:
             logger.info(f'_configure_services: {created_msg("service", name)}')
+            return
+    assert len(existing) == 1
+    # Convert to k8s object to compare
+    new_svc = kubernetes_utils.dict_to_k8s_object(service, 'V1Service')
+    if new_svc.spec.ports == existing[0].spec.ports:
+        logger.info(
+            f'_configure_services: {using_existing_msg("service", name)}')
+        return
+    logger.info(
+        f'_configure_services: {updating_existing_msg("service", name)}')
+    kubernetes.core_api(context).patch_namespaced_service(
+        name, namespace, service)
 
 
 class KubernetesError(Exception):
