@@ -1,4 +1,10 @@
 """Service specification for SkyServe."""
+# Lazy annotations: this module is imported (via sky.task) while
+# sky.serve.serve_utils may only be partially initialized, and its method
+# signatures reference serve_utils.TLSCredential; nothing here resolves
+# annotations at runtime.
+from __future__ import annotations
+
 import json
 import os
 import textwrap

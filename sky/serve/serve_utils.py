@@ -22,7 +22,6 @@ import uuid
 import colorama
 import filelock
 
-from sky import backends
 from sky import exceptions
 from sky import global_user_state
 from sky import resources as resources_lib
@@ -52,10 +51,14 @@ if typing.TYPE_CHECKING:
     import requests
 
     import sky
+    from sky import backends
     from sky.serve import replica_managers
 else:
     psutil = adaptors_common.LazyImport('psutil')
     requests = adaptors_common.LazyImport('requests')
+    # Lazy: sky.backends imports most of SkyPilot, including (via sky.task
+    # and sky.serve) this module, so a top-level import is circular.
+    backends = adaptors_common.LazyImport('sky.backends')
 
 logger = sky_logging.init_logger(__name__)
 

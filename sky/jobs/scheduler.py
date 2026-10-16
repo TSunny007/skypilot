@@ -60,6 +60,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.client import sdk
+from sky.jobs import claim_wake
 from sky.jobs import constants as managed_job_constants
 from sky.jobs import file_content_utils
 from sky.jobs import state
@@ -258,9 +259,10 @@ def maybe_start_controllers(
         # would inherit per-request state into a long-lived process tree.
         #
         # This is safe for launch latency: submit_jobs has already moved the job
-        # to WAITING, and a controller from the leader's warm pool claims it
-        # within ~10s (controller.py::monitor_loop). The pool itself is started
-        # by ha_recovery_for_consolidation_mode at leader election.
+        # to WAITING and woken an idle controller from the leader's warm pool
+        # (claim_wake), which claims it at once, or else on its next poll
+        # (controller.py::monitor_loop). The pool itself is started by
+        # ha_recovery_for_consolidation_mode at leader election.
         #
         # Caveat: a controller that dies mid-life is now only replaced on the
         # daemon's ManagedJobEvent tick (~300s), where previously the next
@@ -365,6 +367,35 @@ def submit_jobs(job_ids: List[int],
 
     The user hash should be set (e.g. via SKYPILOT_USER_ID) before calling this.
     """
+    set_jobs_waiting(job_ids,
+                     dag_yaml_path,
+                     original_user_yaml_path,
+                     env_file_path,
+                     os.environ.get(skypilot_config.ENV_VAR_SKYPILOT_CONFIG),
+                     priority,
+                     priority_class=priority_class)
+    maybe_start_controllers(from_scheduler=True)
+
+
+def set_jobs_waiting(job_ids: List[int],
+                     dag_yaml_path: str,
+                     original_user_yaml_path: str,
+                     env_file_path: str,
+                     config_file_path: Optional[str],
+                     priority: int,
+                     priority_class: Optional[str] = None) -> None:
+    """Store the jobs' files in their rows, move them to WAITING, and wake an
+    idle controller to claim them.
+
+    submit_jobs without the controller startup. It starts no process, so a
+    consolidation-mode API server runs it inside the jobs.launch request (see
+    sky/jobs/server/core.py::_submit_in_process), where controller startup is
+    the refresh daemon's anyway.
+
+    Args:
+        config_file_path: the job's SkyPilot config file
+            (SKYPILOT_CONFIG for the controller), or None for no config.
+    """
     job_ids_without_controller_process = []
     for job_id in job_ids:
         controller_process = state.get_job_controller_process(job_id)
@@ -389,9 +420,8 @@ def submit_jobs(job_ids: List[int],
     with open(env_file_path, 'r', encoding='utf-8') as env_file:
         env_file_content = env_file.read()
 
-    # Read config file if SKYPILOT_CONFIG env var is set
+    # Read the config file, if the job has one.
     config_file_content: Optional[str] = None
-    config_file_path = os.environ.get(skypilot_config.ENV_VAR_SKYPILOT_CONFIG)
     if config_file_path:
         config_file_path = os.path.expanduser(config_file_path)
         if os.path.exists(config_file_path):
@@ -409,7 +439,8 @@ def submit_jobs(job_ids: List[int],
     state.scheduler_set_waiting(job_ids, dag_yaml_content,
                                 original_user_yaml_content, env_file_content,
                                 config_file_content, priority, priority_class)
-    maybe_start_controllers(from_scheduler=True)
+    # After the commit, so that a woken controller sees the jobs WAITING.
+    claim_wake.wake_controllers(len(job_ids))
 
 
 @contextlib.asynccontextmanager

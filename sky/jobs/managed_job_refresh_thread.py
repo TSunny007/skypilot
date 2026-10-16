@@ -8,6 +8,7 @@ import typing
 from typing import Optional
 
 from sky import sky_logging
+from sky.jobs import claim_wake
 from sky.jobs import constants as managed_job_constants
 from sky.jobs import scheduler as managed_job_scheduler
 from sky.jobs import utils as managed_job_utils
@@ -210,3 +211,6 @@ def start_managed_job_refresh_daemon() -> None:
         return
     logger.info('Starting the managed-job refresh thread')
     ManagedJobRefreshDaemonThread().start()
+    # On every replica, not just the leader: it relays wake-ups for jobs
+    # submitted on any replica to whichever one runs the controllers.
+    claim_wake.start_relay()

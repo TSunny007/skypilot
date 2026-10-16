@@ -198,7 +198,7 @@ ROOT_JOB_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}ROOT_JOB_ID'
 # cluster yaml is updated.
 #
 # TODO(zongheng,zhanghao): make the upgrading of skylet automatic?
-SKYLET_VERSION = '43'  # managed job table query takes include_tree.
+SKYLET_VERSION = '44'  # Faster Ray bring-up: guarded dep pins, stale-stop skip.
 # The version of the lib files that skylet/jobs use. Whenever there is an API
 # change for the job_lib or log_lib, we need to bump this version, so that the
 # user can be notified to update their SkyPilot version on the remote cluster.
@@ -393,6 +393,17 @@ SKY_USER_ENV_CREATION_COMMANDS = (
 
 _sky_version = str(version.parse(sky.__version__))
 RAY_STATUS = f'RAY_ADDRESS=127.0.0.1:{SKY_REMOTE_RAY_PORT} {SKY_RAY_CMD} status'
+# True when the runtime env already satisfies the setuptools/click pins that
+# Ray needs (e.g. baked into the container image), so the installs below can
+# be skipped entirely. importlib.metadata is stdlib; any failure (missing
+# package, unparsable version, no python) exits non-zero and falls through to
+# the installs. Simple integer comparisons, so no packaging library is needed.
+# Skipping both installs saves a uv resolve+downgrade per node per launch.
+_RAY_DEP_PINS_SATISFIED_CMD = (
+    f'{SKY_PYTHON_CMD} -c "'
+    'import importlib.metadata as m;'
+    'v=lambda p:[int(x) for x in m.version(p).split(\'.\')[:2]];'
+    'assert v(\'setuptools\')[0]<70 and v(\'click\')<[8,3]" 2> /dev/null')
 RAY_INSTALLATION_COMMANDS = (
     f'{SKY_UV_INSTALL_CMD};'
     f'{SETUP_SKY_DIRS_COMMANDS}'
@@ -401,14 +412,18 @@ RAY_INSTALLATION_COMMANDS = (
     # Install setuptools<=69.5.1 to avoid the issue with the latest setuptools
     # causing the error:
     #   ImportError: cannot import name 'packaging' from 'pkg_resources'"
-    f'{SKY_UV_PIP_CMD} install "setuptools<70"; '
     # Always pin click<8.3.0: click 8.3.0+ breaks Ray CLI due to deepcopy
     # issues with Sentinel values. We force this even when ray is already
     # installed (e.g. baked into the SkyPilot AMI), since the ray-version
     # idempotency guard below would otherwise skip the install and leave
     # click at whatever the AMI shipped.
     # See: https://github.com/ray-project/ray/issues/56747
-    f'{SKY_UV_PIP_CMD} install "click<8.3.0"; '
+    # Both pins are skipped when the env already satisfies them (e.g. baked
+    # into the image, see Dockerfile_k8s): the unconditional install paid a
+    # uv resolve plus a setuptools downgrade (the seeded venv ships the
+    # latest setuptools) on every node of every launch.
+    f'{{ {_RAY_DEP_PINS_SATISFIED_CMD}; }} || '
+    f'{{ {SKY_UV_PIP_CMD} install "setuptools<70" "click<8.3.0"; }}; '
     # Backward compatibility for ray upgrade (#3248): do not upgrade ray if the
     # ray cluster is already running, to avoid the ray cluster being restarted.
     #

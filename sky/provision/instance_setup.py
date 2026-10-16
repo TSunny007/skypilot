@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import tarfile
 import time
@@ -15,7 +16,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from sky import exceptions
 from sky import logs
 from sky import provision
-from sky import resources as resources_lib
 from sky import sky_logging
 from sky import skypilot_config
 from sky.provision import common
@@ -34,6 +34,9 @@ from sky.utils import source_utils
 from sky.utils import subprocess_utils
 from sky.utils import timeline
 from sky.utils import ux_utils
+
+# Used only in a quoted annotation (see start_skylet_on_head_node).
+from sky import resources as resources_lib  # isort: skip  # pylint: disable=unused-import
 
 logger = sky_logging.init_logger(__name__)
 
@@ -136,9 +139,18 @@ _TARGET_NOFILE = 1048576
 # poison the status even with the probe fixed.
 #
 # Inlined into ibm-ray.yml.j2 as `ray_prlimit_command`.
+#
+# Match the raylet by its exact process name (comm), not `pgrep -f
+# raylet/raylet`: the -f pattern matched the cmdline of any process whose
+# argv embeds this command string itself -- on Kubernetes that is PID 1 (the
+# pod command contains the rendered template) and the STEP subshells, so the
+# head made 5 pids x 2 failing `sudo prlimit` calls per start (PID 1 is not
+# tunable by a non-root user). An exact comm match can never self-match. If
+# pgrep is absent (no procps on minimal images) or lacks -x, the `command -v`
+# chain short-circuits and this whole block stays a no-op.
 RAY_PRLIMIT = (
     'command -v prlimit >/dev/null 2>&1 && '
-    'for id in $(pgrep -f raylet/raylet); do '
+    'for id in $(pgrep -x raylet); do '
     'hard=$(awk \'/Max open files/ {print $5}\' /proc/$id/limits); '
     f'sudo prlimit --nofile={_TARGET_NOFILE}:{_TARGET_NOFILE} --pid=$id '
     '2>/dev/null || sudo prlimit --nofile="$hard:" --pid=$id || '
@@ -178,6 +190,19 @@ _SOURCE_LEGACY_HOST_NETWORK_PORTS = (
     'fi; ')
 
 _RAY_PATCHES_TARGET_DIR = '/tmp/sky_ray_patches'
+
+# `ray stop` before `ray start`, but only when a previous Ray session could
+# still be alive: Ray always creates its temp dir (passed as --temp-dir) at
+# startup, so a missing dir means no SkyPilot Ray was ever started here --
+# the common case for fresh Kubernetes pods and fresh VMs, where `ray stop`
+# is a guaranteed no-op that still costs the Ray CLI import plus its process
+# scan (measured 4.0 s on a fresh K8s head pod, ~1.5-2 s on workers). A stale
+# session (rebooted VM, retried start) always has the dir and is still
+# stopped first. Exit status semantics match the previous bare `ray stop;`:
+# when the dir exists, `ray stop`'s status propagates; when it does not, the
+# test succeeds.
+_RAY_STOP_IF_STALE = (f'[ ! -d {constants.SKY_REMOTE_RAY_TEMPDIR} ] || '
+                      f'{{ {constants.SKY_RAY_CMD} stop; }}')
 
 
 @functools.lru_cache(maxsize=1)
@@ -325,16 +350,76 @@ _READ_RAY_PORT_PY = (
     f'\'{constants.SKY_RUNTIME_DIR_ENV_VAR_KEY}\', \'~\')); '
     'print(json.load(open(os.path.join(d, '
     f'\'{constants.SKY_REMOTE_RAY_PORT_FILE}\')))[\'ray_port\'])')
+# The payload encoding is inlined with stdlib json only — it must match
+# message_utils.encode_payload's '<sky-payload>{json}</sky-payload>\n'
+# format for the caller's decode_payload. Importing sky.utils.message_utils
+# here would pay the full eager `sky/__init__` import (1.9-2.9 s warm) on
+# EVERY health-check poll, which dominates the per-check cost.
+_ENCODE_RAY_PORT_PAYLOAD_PY = (
+    'import json; '
+    'print(\'<sky-payload>\' + json.dumps({\'ray_port\': $RAY_PORT}) + '
+    '\'</sky-payload>\\n\')')
 _RAY_PORT_COMMAND = (
     f'RAY_PORT=$({constants.SKY_PYTHON_CMD} -c "{_READ_RAY_PORT_PY}" '
     f'2> /dev/null || echo {constants.SKY_REMOTE_RAY_PORT});'
-    f'{constants.SKY_PYTHON_CMD} -c "from sky.utils import message_utils; '
-    'print(message_utils.encode_payload({\'ray_port\': $RAY_PORT}))"')
+    f'{constants.SKY_PYTHON_CMD} -c "{_ENCODE_RAY_PORT_PAYLOAD_PY}"')
 
 # Command that calls `ray status` with SkyPilot's Ray port set.
 RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND = (
     f'{_RAY_PORT_COMMAND}; '
     f'RAY_ADDRESS=127.0.0.1:$RAY_PORT {constants.SKY_RAY_CMD} status')
+
+# Live list of the Ray nodes alive in the head's GCS, for the provisioner's
+# readiness wait on fresh Kubernetes clusters. `ray status` (above) reports
+# the autoscaler monitor's last published snapshot, which lags node
+# registration by up to its 5 s update interval, and every call pays a full
+# Ray CLI import (1.4 s warm; several seconds on a fresh, CPU-contended pod).
+# This queries the GCS node table directly through ray._raylet (~0.4 s), so
+# the wait ends as soon as the last node registers. It uses Ray-internal
+# APIs of SkyPilot's pinned Ray (2.9.3): any failure other than "not up yet"
+# makes the caller fall back to RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND.
+# Prints the ray_port payload (as RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND does),
+# then the alive nodes' IPs; exits RAY_GCS_NOT_UP_EXIT_CODE only when the GCS
+# is not reachable (yet). Ray not importable by SKY_PYTHON_CMD is a plain
+# failure, so the caller falls back to `ray status` (which runs on the same
+# interpreter): on Kubernetes the pod writes python_path and installs Ray
+# before its STEP 2 marker, which the provisioner's runtime setup waits on.
+RAY_GCS_NOT_UP_EXIT_CODE = 3
+_RAY_ALIVE_NODES_TAG = 'sky-ray-alive-nodes'
+_RAY_ALIVE_NODES_PATTERN = re.compile(
+    f'<{_RAY_ALIVE_NODES_TAG}>(.*?)</{_RAY_ALIVE_NODES_TAG}>')
+_RAY_ALIVE_NODES_PY = (
+    'import json, sys; '
+    'import ray._raylet as r; '
+    'a = \'127.0.0.1:\' + sys.argv[1]; '
+    f'r.check_health(a) or sys.exit({RAY_GCS_NOT_UP_EXIT_CODE}); '
+    'n = r.GcsClient(address=a).get_all_node_info(timeout=10).values(); '
+    # GcsNodeInfo.GcsNodeState: ALIVE = 0, DEAD = 1. node_name is the node
+    # IP Ray was started with (--node-ip-address).
+    'ips = sorted(v[\'node_name\'].decode() for v in n if v[\'state\'] == 0); '
+    f'print(\'<{_RAY_ALIVE_NODES_TAG}>\' + json.dumps(ips) + '
+    f'\'</{_RAY_ALIVE_NODES_TAG}>\')')
+RAY_ALIVE_NODES_WITH_SKY_RAY_PORT_COMMAND = (
+    f'{_RAY_PORT_COMMAND}; '
+    f'{constants.SKY_PYTHON_CMD} -c "{_RAY_ALIVE_NODES_PY}" $RAY_PORT')
+
+
+def parse_ray_alive_nodes(output: str) -> Optional[List[str]]:
+    """The alive node IPs printed by RAY_ALIVE_NODES_WITH_SKY_RAY_PORT_COMMAND.
+
+    Returns None if the output carries no well-formed list.
+    """
+    match = _RAY_ALIVE_NODES_PATTERN.search(output)
+    if match is None:
+        return None
+    try:
+        nodes = json.loads(match.group(1))
+    except ValueError:
+        return None
+    if not isinstance(nodes, list):
+        return None
+    return [str(node) for node in nodes]
+
 
 # Command that waits for the ray status to be initialized. Otherwise, a later
 # `sky status -r` may fail due to the ray cluster not being ready.
@@ -419,9 +504,13 @@ class SSHThreadPoolExecutor(futures.ThreadPoolExecutor):
         # ssh command runner eventually calls
         # log_lib.run_with_log, which will spawn
         # subprocesses. If we are exiting the context
-        # we need to kill the children processes
-        # to avoid leakage.
-        subprocess_utils.kill_children_processes()
+        # on an error, we need to kill the children processes
+        # to avoid leakage. On a normal exit every task has
+        # returned, so none of its subprocesses is left; the
+        # kill is skipped so it cannot hit subprocesses of
+        # setup steps running concurrently in other threads.
+        if exc_type is not None:
+            subprocess_utils.kill_children_processes()
         self.shutdown()
         return False
 
@@ -593,11 +682,34 @@ _SHARED_RAY_PORT_FLAGS = (
 
 
 def ray_head_start_command(custom_resource: Optional[str],
-                           custom_ray_options: Optional[Dict[str, Any]]) -> str:
-    """Returns the command to start Ray on the head node."""
+                           custom_ray_options: Optional[Dict[str, Any]],
+                           wait_initialized: bool = True) -> str:
+    """Returns the command to start Ray on the head node.
+
+    Args:
+        wait_initialized: End with RAY_HEAD_WAIT_INITIALIZED_COMMAND, which
+            polls `ray status` until the autoscaler monitor has published
+            its first status, so that a status refresh right after
+            provisioning does not see an uninitialized cluster. Kubernetes
+            pods run this command in their own bootstrap, where the loop
+            gates nothing (pass False): the pod's readiness markers are set
+            before Ray starts, and the provisioner itself waits until the
+            cluster's nodes are all up. There the loop only burns head CPU
+            on repeated Ray CLI imports (2.4 s warm, 6.8 s cold per `ray
+            status`) while the worker pods' Ray starts and the provisioner's
+            checks compete for it.
+    """
     ray_options = (
         # --disable-usage-stats in `ray start` saves 10 seconds of idle wait.
         f'--disable-usage-stats '
+        # --include-dashboard=false starts only a minimal dashboard head
+        # (UsageStatsHead, no frontend): nothing in SkyPilot consumes the
+        # dashboard HTTP API (port 8266 is documented as reserved), and the
+        # full dashboard's startup delays the head raylet by ~1 s because
+        # `ray start` blocks on the dashboard's GCS KV registration before
+        # starting the raylet. The raylet's per-node dashboard agent is
+        # unaffected (it fate-shares with the raylet).
+        f'--include-dashboard=false '
         f'--port=${{SKYPILOT_RAY_PORT:-{constants.SKY_REMOTE_RAY_PORT}}} '
         f'--dashboard-port=${{SKYPILOT_RAY_DASHBOARD_PORT:-'
         f'{constants.SKY_REMOTE_RAY_DASHBOARD_PORT}}} '
@@ -617,7 +729,7 @@ def ray_head_start_command(custom_resource: Optional[str],
             ray_options += f' --{key}={value}'
 
     cmd = (
-        _host_network_probe_cmd('head') + f'{constants.SKY_RAY_CMD} stop; '
+        _host_network_probe_cmd('head') + f'{_RAY_STOP_IF_STALE}; '
         'RAY_SCHEDULER_EVENTS=0 RAY_DEDUP_LOGS=0 '
         # worker_maximum_startup_concurrency controls the maximum number of
         # workers that can be started concurrently. However, it also controls
@@ -635,7 +747,9 @@ def ray_head_start_command(custom_resource: Optional[str],
         # the warning when the worker count is >12x CPUs.
         'RAY_worker_maximum_startup_concurrency=$(( 3 * $(nproc --all) )) '
         f'{constants.SKY_RAY_CMD} start --head {ray_options} || exit 1;' +
-        RAY_PRLIMIT + DUMP_RAY_PORTS + RAY_HEAD_WAIT_INITIALIZED_COMMAND)
+        RAY_PRLIMIT + DUMP_RAY_PORTS)
+    if wait_initialized:
+        cmd += RAY_HEAD_WAIT_INITIALIZED_COMMAND
     return cmd
 
 
@@ -679,9 +793,10 @@ def ray_worker_start_command(custom_resource: Optional[str],
             'grep "gcs-address=${SKYPILOT_RAY_HEAD_IP}:${SKYPILOT_RAY_PORT}" '
             f'|| {{ {_host_network_probe_cmd("worker")}{cmd} }}')
         return cmd
-    # `ray stop` first, so the ports really are free by the time the probe
-    # runs and the assertion means what it says.
-    cmd = f'{constants.SKY_RAY_CMD} stop; ' + cmd
+    # `ray stop` first (when a previous session may exist), so the ports
+    # really are free by the time the probe runs and the assertion means
+    # what it says.
+    cmd = f'{_RAY_STOP_IF_STALE}; ' + cmd
     return _host_network_probe_cmd('worker') + cmd
 
 
@@ -807,9 +922,13 @@ def start_ray_on_worker_nodes(cluster_name: str, no_restart: bool,
 @_auto_retry()
 @timeline.event
 def start_skylet_on_head_node(
-        cluster_name: resources_utils.ClusterName,
-        cluster_info: common.ClusterInfo, ssh_credentials: Dict[str, Any],
-        launched_resources: resources_lib.Resources) -> None:
+    cluster_name: resources_utils.ClusterName,
+    cluster_info: common.ClusterInfo,
+    ssh_credentials: Dict[str, Any],
+    # Quoted: this module is imported (via sky.clouds.kubernetes) while
+    # sky.resources may only be partially initialized.
+    launched_resources: 'resources_lib.Resources'
+) -> None:
     """Start skylet on the head node."""
     # Avoid circular import.
     # pylint: disable=import-outside-toplevel

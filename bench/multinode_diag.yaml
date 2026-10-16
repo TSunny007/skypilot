@@ -1,0 +1,8 @@
+# Diagnostic variant of multinode.yaml: identical start path, but the run
+# sleeps so pods stay alive long enough to pull in-pod logs.
+name: multinode-bench
+resources: {infra: kubernetes, cpus: 1+, memory: 1+}
+num_nodes: 4
+run: |
+  echo "[rank ${SKYPILOT_NODE_RANK}] started at $(date +%s.%N) on $(hostname)"
+  sleep 60

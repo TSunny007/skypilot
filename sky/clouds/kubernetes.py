@@ -4,6 +4,7 @@ import fnmatch
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.kubernetes.utils import is_tpu_on_gke
 from sky.provision.kubernetes.utils import KubernetesHighPerformanceNetworkType
 from sky.provision.kubernetes.utils import normalize_tpu_accelerator_name
+from sky.setup_files import dependencies
 from sky.skylet import constants
 from sky.utils import annotations
 from sky.utils import common
@@ -61,6 +63,24 @@ AWS_EFA_RESOURCE_KEY = 'vpc.amazonaws.com/efa'
 # mode falls inside the kubelet's deterministic SIGKILL rather than
 # the autoscaler's.
 _PREEMPTION_GRACE_CAP_SECONDS = 600
+
+
+def _skypilot_dependencies_install_args() -> str:
+    """Shell-quoted requirements of `skypilot[kubernetes,remote]`.
+
+    The pod installs these at container start, in parallel with pod startup,
+    so that the wheel install after the pod is up only adds `skypilot`
+    itself. SkyPilot itself is not installed from PyPI: the API server's own
+    wheel replaces it right away. On an image that already has every
+    dependency (the default image) this is a check with no network access.
+    """
+    requirements: List[str] = []
+    for requirement in (dependencies.install_requires +
+                        dependencies.extras_require['kubernetes'] +
+                        dependencies.extras_require['remote']):
+        if requirement not in requirements:
+            requirements.append(requirement)
+    return ' '.join(shlex.quote(r) for r in requirements)
 
 
 def _compute_preemption_hook_timeout(
@@ -1424,10 +1444,12 @@ class Kubernetes(clouds.Cloud):
             'k8s_env_vars': k8s_env_vars,
             'image_id': image_id,
             'ray_installation_commands': constants.RAY_INSTALLATION_COMMANDS,
+            'skypilot_dependencies_install_args':
+                _skypilot_dependencies_install_args(),
             'ray_patches_cmd': instance_setup.ray_patches_cmd(
                 constants.SKY_REMOTE_RAY_VERSION),
             'ray_head_start_command': instance_setup.ray_head_start_command(
-                custom_resources, custom_ray_options),
+                custom_resources, custom_ray_options, wait_initialized=False),
             'skypilot_ray_port': constants.SKY_REMOTE_RAY_PORT,
             'ray_worker_start_command': instance_setup.ray_worker_start_command(
                 custom_resources, custom_ray_options, no_restart=False),

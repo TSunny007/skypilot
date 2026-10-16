@@ -52,6 +52,16 @@ provider:
     # Boolean flag to indicate if the cluster requires FUSE mounting.
     # Used to set up the necessary permissions and sidecars.
     fuse_device_required: {{k8s_fuse_device_required}}
+    {#- The fast_start sections use `{%-` so that, when off, the rendered
+        file is byte-identical to the template without them. #}
+    {%- if fast_start is defined and fast_start %}
+    # Push-based self-start (sky/provision/kubernetes/fast_start.py): the
+    # names of the ConfigMap (and Secret, if the task has secrets) that carry
+    # the job. Only names; the data never goes through this file.
+    fast_start:
+      configmap: {{fast_start.configmap}}
+      secret: {{fast_start.secret | tojson}}
+    {%- endif %}
 
     {% if ephemeral_volume_mounts %}
     ephemeral_volume_specs: {{ephemeral_volume_mounts | tojson}}
@@ -525,6 +535,18 @@ available_node_types:
         - name: dshm
           emptyDir:
             medium: Memory
+        {%- if fast_start is defined and fast_start %}
+        - name: sky-fast-start
+          projected:
+            defaultMode: 292  # 0444
+            sources:
+            - configMap:
+                name: {{fast_start.configmap}}
+            {%- if fast_start.secret %}
+            - secret:
+                name: {{fast_start.secret}}
+            {%- endif %}
+        {%- endif %}
         {% if k8s_rdma_host_device_access %}
         - name: devinf
           hostPath:
@@ -845,6 +867,13 @@ available_node_types:
               # the limits.conf entry written in setup_commands, applied by
               # pam_limits at login.
               {{raise_nofile_limit_command}}
+              {%- if fast_start is defined and fast_start %}
+
+              # Push-based self-start: register and start the job from inside
+              # the pod, in the background, off the bootstrap steps below. The
+              # job itself comes from the mounted ConfigMap/Secret.
+              ( /bin/bash {{fast_start.mount_dir}}/fast_start.sh > /tmp/sky_fast_start.log 2>&1 & )
+              {%- endif %}
 
               # Marker STEP 1 publishes once the CORE prereqs (curl/rsync/wget)
               # are installed AND CONFIGURED -- i.e. the package manager has
@@ -1457,7 +1486,9 @@ available_node_types:
 
                 # set UV_SYSTEM_PYTHON to false in case the user provided docker image set it to true.
                 # unset PYTHONPATH and set CWD to $HOME to avoid user image interfering with SkyPilot runtime.
-                VIRTUAL_ENV=${SKY_RUNTIME_DIR:-$HOME}/skypilot-runtime UV_LINK_MODE=copy UV_SYSTEM_PYTHON=false {{sky_unset_pythonpath_and_set_cwd}} ~/.local/bin/uv pip install skypilot[kubernetes,remote]
+                # Dependencies only (a no-network check on images that ship them): SkyPilot
+                # itself comes from the API server's wheel, installed by setup_commands.
+                VIRTUAL_ENV=${SKY_RUNTIME_DIR:-$HOME}/skypilot-runtime UV_LINK_MODE=copy UV_SYSTEM_PYTHON=false {{sky_unset_pythonpath_and_set_cwd}} ~/.local/bin/uv pip install {{ skypilot_dependencies_install_args }}
                 # Wait (bounded) for the best-effort `patch` install to land
                 # before applying the Ray patches. An image may ship no `patch`
                 # and have no usable repo, so proceed after 60s rather than hang
@@ -1760,6 +1791,11 @@ available_node_types:
           volumeMounts:
           - mountPath: /dev/shm
             name: dshm
+          {%- if fast_start is defined and fast_start %}
+          - mountPath: {{fast_start.mount_dir}}
+            name: sky-fast-start
+            readOnly: true
+          {%- endif %}
           {% if k8s_rdma_host_device_access %}
           - mountPath: /dev/infiniband
             name: devinf

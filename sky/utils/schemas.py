@@ -2179,6 +2179,17 @@ def get_config_schema():
             # server-side validation.
             'additionalProperties': _allow_additional_properties(),
             'properties': {
+                # Push-based self-start of managed-job clusters; see
+                # sky/provision/kubernetes/fast_start.py.
+                'fast_start': {
+                    'type': 'boolean',
+                },
+                # Set to false to keep tasks that have `secrets:` off the
+                # fast-start path (their values would sit in a Kubernetes
+                # Secret until teardown).
+                'fast_start_secrets': {
+                    'type': 'boolean',
+                },
                 'allowed_contexts': {
                     'oneOf': [{
                         'type': 'array',
