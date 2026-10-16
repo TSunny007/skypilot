@@ -265,18 +265,14 @@ ray.get(pg.ready())
 print('\x1b[2m└── \x1b[0mJob started. Streaming logs... \x1b[2m(Ctrl-C to exit log streaming; job will not be killed)\x1b[0m', flush=True)
 job_lib.set_job_started(3)
 job_lib.scheduler.schedule_step()
-@ray.remote
-def check_ip():
-    return ray.util.get_node_ip_address()
-gang_scheduling_id_to_ip = ray.get([
-    check_ip.options(
-            num_cpus=2.0,
-            scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_bundle_index=i
-            )).remote()
+_bundles_to_node_id = ray_util.placement_group_table(
+    pg)['bundles_to_node_id']
+_node_id_to_ip = {n['NodeID']: n['NodeManagerAddress']
+                  for n in ray.nodes()}
+gang_scheduling_id_to_ip = [
+    _node_id_to_ip[_bundles_to_node_id[i]]
     for i in range(pg.bundle_count)
-])
+]
 
 cluster_ips_to_node_id = {ip: i for i, ip in enumerate(['10.0.0.1', '10.0.0.2'])}
 # Unmapped IPs (multi-NIC: Ray reports a NIC SkyPilot didn't record)

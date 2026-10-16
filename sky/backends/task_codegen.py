@@ -449,10 +449,9 @@ class RayCodeGen(TaskCodeGen):
         setup_log_path = os.path.join(log_dir, 'setup.log')
 
         bundles = [copy.copy(resources_dict) for _ in range(num_nodes)]
-        # Set CPU to avoid ray hanging the resources allocation
-        # for remote functions, since the task will request 1 CPU
-        # by default.
-        task_cpu_demand = resources_dict.pop('CPU')
+        # Drop CPU from resources_dict so the accelerator check below sees
+        # only the accelerator entry; the bundles (copied above) keep it.
+        resources_dict.pop('CPU')
 
         if resources_dict:
             assert len(resources_dict) == 1, (
@@ -555,21 +554,23 @@ class RayCodeGen(TaskCodeGen):
             # schedule the next pending job.
             self._code.append('job_lib.scheduler.schedule_step()')
 
-        # Export IP and node rank to the environment variables.
+        # Export IP and node rank to the environment variables. The bundle ->
+        # node IP map comes from GCS (the placement group table plus the node
+        # table) rather than from one check_ip task per bundle, which cost a
+        # gang-wide task round trip (a worker start per node) after
+        # pg.ready(). The IPs are the same: NodeManagerAddress is the address
+        # each raylet was started with (--node-ip-address), which is what
+        # ray.util.get_node_ip_address() returned inside check_ip.
         self._code += [
             textwrap.dedent(f"""\
-                @ray.remote
-                def check_ip():
-                    return ray.util.get_node_ip_address()
-                gang_scheduling_id_to_ip = ray.get([
-                    check_ip.options(
-                            num_cpus={task_cpu_demand},
-                            scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
-                                placement_group=pg,
-                                placement_group_bundle_index=i
-                            )).remote()
+                _bundles_to_node_id = ray_util.placement_group_table(
+                    pg)['bundles_to_node_id']
+                _node_id_to_ip = {{n['NodeID']: n['NodeManagerAddress']
+                                  for n in ray.nodes()}}
+                gang_scheduling_id_to_ip = [
+                    _node_id_to_ip[_bundles_to_node_id[i]]
                     for i in range(pg.bundle_count)
-                ])
+                ]
 
                 cluster_ips_to_node_id = {{ip: i for i, ip in enumerate({stable_cluster_internal_ips!r})}}
                 # Unmapped IPs (multi-NIC: Ray reports a NIC SkyPilot didn't record)

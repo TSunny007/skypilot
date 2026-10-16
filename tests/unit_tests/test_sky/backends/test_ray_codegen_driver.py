@@ -173,3 +173,13 @@ def test_per_node_runner_runs_without_importing_sky(tmp_path):
         assert [l for l in lines if l in expected] == expected, lines
         assert not any('no job control' in l for l in lines)
     assert not any(l.endswith('\r\n') for l in logged)
+
+
+@pytest.mark.parametrize('num_nodes', [1, 4])
+def test_bundle_ips_come_from_gcs_not_check_ip_tasks(num_nodes):
+    """No check_ip task fan-out after pg.ready(): the map is read from GCS."""
+    code = _build_driver(num_nodes, with_setup=False)
+    assert 'check_ip' not in code
+    assert 'placement_group_table(\n    pg)[\'bundles_to_node_id\']' in code
+    # The only remote calls are the per-node runner's, one per rank.
+    assert code.count('.remote(') - code.count('ray.remote(') == num_nodes
