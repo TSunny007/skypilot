@@ -7,12 +7,18 @@ import typing
 from sky.adaptors import common as adaptors_common
 from sky.adaptors import vsphere as vsphere_adaptor
 from sky.catalog.common import get_catalog_path
-from sky.provision.vsphere.common.cls_api_client import ClsApiClient
 
 if typing.TYPE_CHECKING:
     import pandas as pd
+
+    from sky.provision.vsphere.common import cls_api_client
 else:
     pd = adaptors_common.LazyImport('pandas')
+    # Lazy: importing it runs sky/provision/__init__.py, which imports every
+    # provisioner, including sky.provision.vsphere.vsphere_utils, which
+    # imports this module.
+    cls_api_client = adaptors_common.LazyImport(
+        'sky.provision.vsphere.common.cls_api_client')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -486,7 +492,7 @@ def initialize_images_csv(csv_saving_path: str, vc_object,
     vc_tag_obj = vsphere_adaptor.get_tagging_client().Tag(vc_stub_config)
     vc_tag_association_obj = vsphere_adaptor.get_tagging_client(
     ).TagAssociation(vc_stub_config)
-    cl_client_obj = ClsApiClient(vc_servicemanager)
+    cl_client_obj = cls_api_client.ClsApiClient(vc_servicemanager)
     content_library_ids = cl_client_obj.local_library_service.list()
     library_item_service_item_obj = cl_client_obj.library_item_service
     vmtx_service_item_obj = cl_client_obj.vmtx_service
