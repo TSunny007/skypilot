@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import tarfile
 import time
@@ -365,6 +366,57 @@ _RAY_PORT_COMMAND = (
 RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND = (
     f'{_RAY_PORT_COMMAND}; '
     f'RAY_ADDRESS=127.0.0.1:$RAY_PORT {constants.SKY_RAY_CMD} status')
+
+# Live list of the Ray nodes alive in the head's GCS, for the provisioner's
+# readiness wait on fresh Kubernetes clusters. `ray status` (above) reports
+# the autoscaler monitor's last published snapshot, which lags node
+# registration by up to its 5 s update interval, and every call pays a full
+# Ray CLI import (1.4 s warm; several seconds on a fresh, CPU-contended pod).
+# This queries the GCS node table directly through ray._raylet (~0.4 s), so
+# the wait ends as soon as the last node registers. It uses Ray-internal
+# APIs of SkyPilot's pinned Ray (2.9.3): any failure other than "not up yet"
+# makes the caller fall back to RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND.
+# Prints the ray_port payload (as RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND does),
+# then the alive nodes' IPs; exits RAY_GCS_NOT_UP_EXIT_CODE when Ray is not
+# installed or the GCS is not reachable yet.
+RAY_GCS_NOT_UP_EXIT_CODE = 3
+_RAY_ALIVE_NODES_TAG = 'sky-ray-alive-nodes'
+_RAY_ALIVE_NODES_PATTERN = re.compile(
+    f'<{_RAY_ALIVE_NODES_TAG}>(.*?)</{_RAY_ALIVE_NODES_TAG}>')
+_RAY_ALIVE_NODES_PY = (
+    'import importlib.util, json, sys; '
+    'importlib.util.find_spec(\'ray\') or '
+    f'sys.exit({RAY_GCS_NOT_UP_EXIT_CODE}); '
+    'import ray._raylet as r; '
+    'a = \'127.0.0.1:\' + sys.argv[1]; '
+    f'r.check_health(a) or sys.exit({RAY_GCS_NOT_UP_EXIT_CODE}); '
+    'n = r.GcsClient(address=a).get_all_node_info(timeout=10).values(); '
+    # GcsNodeInfo.GcsNodeState: ALIVE = 0, DEAD = 1. node_name is the node
+    # IP Ray was started with (--node-ip-address).
+    'ips = sorted(v[\'node_name\'].decode() for v in n if v[\'state\'] == 0); '
+    f'print(\'<{_RAY_ALIVE_NODES_TAG}>\' + json.dumps(ips) + '
+    f'\'</{_RAY_ALIVE_NODES_TAG}>\')')
+RAY_ALIVE_NODES_WITH_SKY_RAY_PORT_COMMAND = (
+    f'{_RAY_PORT_COMMAND}; '
+    f'{constants.SKY_PYTHON_CMD} -c "{_RAY_ALIVE_NODES_PY}" $RAY_PORT')
+
+
+def parse_ray_alive_nodes(output: str) -> Optional[List[str]]:
+    """The alive node IPs printed by RAY_ALIVE_NODES_WITH_SKY_RAY_PORT_COMMAND.
+
+    Returns None if the output carries no well-formed list.
+    """
+    match = _RAY_ALIVE_NODES_PATTERN.search(output)
+    if match is None:
+        return None
+    try:
+        nodes = json.loads(match.group(1))
+    except ValueError:
+        return None
+    if not isinstance(nodes, list):
+        return None
+    return [str(node) for node in nodes]
+
 
 # Command that waits for the ray status to be initialized. Otherwise, a later
 # `sky status -r` may fail due to the ray cluster not being ready.
