@@ -501,9 +501,13 @@ class SSHThreadPoolExecutor(futures.ThreadPoolExecutor):
         # ssh command runner eventually calls
         # log_lib.run_with_log, which will spawn
         # subprocesses. If we are exiting the context
-        # we need to kill the children processes
-        # to avoid leakage.
-        subprocess_utils.kill_children_processes()
+        # on an error, we need to kill the children processes
+        # to avoid leakage. On a normal exit every task has
+        # returned, so none of its subprocesses is left; the
+        # kill is skipped so it cannot hit subprocesses of
+        # setup steps running concurrently in other threads.
+        if exc_type is not None:
+            subprocess_utils.kill_children_processes()
         self.shutdown()
         return False
 
