@@ -80,7 +80,7 @@ Our single 8-core Kind node with a warm cache cannot produce numbers that genera
   - no hostNetwork, TPUs, pools, HA or pod re-creation;
   - task secrets sit in a Secret until teardown;
   - NodeLocal DNSCache is untested.
-- **Unmeasured end to end:** the GCS node count, the post-Ready chain, and the one-exec submit and monitor changes. They are in `ll/consolidated` with unit or raw-pod tests only. Unit-test triage of the combined branch is unfinished.
+- **Unmeasured end to end:** the GCS node count, the post-Ready chain, and the one-exec submit and monitor changes. They are in `ll/consolidated` with unit or raw-pod tests only. Unit tests on the combined branch: no failures beyond master's remain (33 left: 15 environment-only, such as missing cloud SDKs, and 18 that also fail on master).
 - **A known regression:** Team D's deps-only pod install (PR #4), as committed, makes the later wheel install resolve 107 dependencies online. That adds 1.4–3.7 s on the fast-start path [measured in raw pods]. It needs `--no-deps` or `--offline` before merge; with that, it saves ~2 s.
 
 ## Not done (by expected value)
