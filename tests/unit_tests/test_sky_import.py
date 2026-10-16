@@ -267,6 +267,7 @@ else:
 
 
 @pytest.mark.parametrize('module', [
+    'sky.catalog.data_fetchers.fetch_vsphere',
     'sky.metrics',
     'sky.metrics.utils',
     'sky.server.auth',
