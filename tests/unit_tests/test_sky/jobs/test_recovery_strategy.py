@@ -11,6 +11,7 @@ from sky import exceptions
 from sky.jobs import recovery_strategy
 from sky.jobs import scheduler as scheduler_module
 from sky.skylet import constants
+from sky.skylet import job_lib
 
 
 def test_is_oom_failure_detects_oomkilled():
@@ -89,7 +90,8 @@ async def test_await_launch_request_returns_on_stream_completion(monkeypatch):
     api_status = mock.MagicMock()
     monkeypatch.setattr(recovery_strategy.sdk, 'api_status', api_status)
 
-    assert await executor._await_launch_request('req-1', stream_task) is None
+    assert await executor._await_launch_request('req-1',
+                                                stream_task) == 'result'
     api_status.assert_not_called()
 
 
@@ -145,7 +147,8 @@ async def test_await_launch_request_tolerates_poll_failures(monkeypatch):
                         '_LAUNCH_REQUEST_STATUS_POLL_SECONDS', 0.01)
 
     # Should not raise despite the status poll failing.
-    assert await executor._await_launch_request('req-1', stream_task) is None
+    assert await executor._await_launch_request('req-1',
+                                                stream_task) == 'result'
     assert api_status.call_count >= 1
 
 
@@ -163,7 +166,8 @@ async def test_await_launch_request_tolerates_unknown_request(monkeypatch):
     monkeypatch.setattr(recovery_strategy,
                         '_LAUNCH_REQUEST_STATUS_POLL_SECONDS', 0.01)
 
-    assert await executor._await_launch_request('req-1', stream_task) is None
+    assert await executor._await_launch_request('req-1',
+                                                stream_task) == 'result'
 
 
 @pytest.mark.asyncio
@@ -1234,3 +1238,167 @@ def test_fixed_submit_reasons_are_exempt_from_the_metric_cap():
         with metrics_utils._launch_retry_kinds_lock:
             metrics_utils._launch_retry_kinds.clear()
             metrics_utils._launch_retry_kinds.update(saved)
+
+
+# ---------------------------------------------------------------------------
+# Fresh-submission fast path: a launch request that just returned a cluster
+# job id has already queued the job, so the start check must not re-verify it
+# on the cluster (four head round trips on Kubernetes).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'result,expected_job_id',
+    [
+        ((7, 'handle'), 7),
+        # Callers that opted in to credentials get a 3-tuple (decoders).
+        ((7, 'handle', 'creds'), 7),
+        # The request did not submit a job.
+        (None, None),
+        ((None, 'handle'), None),
+        # bool is an int subclass; never a job id.
+        ((True, 'handle'), None),
+        # A non-int first element (e.g. an opaque string) is not a job id.
+        (('7', 'handle'), None),
+        # Not a launch result at all.
+        ([], None),
+        ((), None),
+        ('done', None),
+    ])
+def test_fresh_submission_from_result(result, expected_job_id):
+    submission = recovery_strategy._fresh_submission_from_result(result)
+    if expected_job_id is None:
+        assert submission is None
+    else:
+        assert submission is not None
+        assert submission.job_id == expected_job_id
+        assert submission.completed_at > 0
+
+
+@pytest.mark.asyncio
+async def test_submit_wait_fast_path_skips_reverification(monkeypatch):
+    """The job the launch just queued is past INIT by definition."""
+    executor = _make_submit_wait_executor(monkeypatch)
+    monkeypatch.setattr(recovery_strategy.managed_job_runtime, 'is_registered',
+                        lambda: False)
+    refresh = mock.Mock(side_effect=AssertionError('re-verified the cluster'))
+    monkeypatch.setattr(recovery_strategy.backend_utils,
+                        'refresh_cluster_status_handle', refresh)
+
+    async def status_must_not_be_polled(*args, **kwargs):
+        raise AssertionError('re-verified the job status')
+
+    monkeypatch.setattr(recovery_strategy.managed_job_utils, 'get_job_status',
+                        status_must_not_be_polled)
+    executor._fresh_submission = recovery_strategy._FreshSubmission(
+        job_id=7, completed_at=42.0)
+
+    assert await executor._wait_until_job_starts_on_cluster() == (42.0, None)
+    # Consumed: it describes only the request that just completed, so a later
+    # wait (e.g. after a recovery) must not see it.
+    assert executor._fresh_submission is None
+    refresh.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_submit_wait_fast_path_skipped_when_runtime_registered(
+        monkeypatch):
+    """A runtime plugin owns the status; the launch result cannot bypass it."""
+    executor = _make_bare_executor()
+    executor.cluster_name = 'test-cluster'
+    runtime = recovery_strategy.managed_job_runtime
+    monkeypatch.setattr(runtime, 'is_registered', lambda: True)
+    monkeypatch.setattr(recovery_strategy.global_user_state,
+                        'get_handle_from_cluster_name', lambda _: object())
+    monkeypatch.setattr(runtime, 'get_job_status', lambda *_:
+                        (job_lib.JobStatus.RUNNING, None))
+    monkeypatch.setattr(runtime, 'get_job_submitted_at', lambda *_: 123.45)
+    executor._fresh_submission = recovery_strategy._FreshSubmission(
+        job_id=7, completed_at=42.0)
+
+    # The runtime's answer wins over the fast path's 42.0.
+    assert await executor._wait_until_job_starts_on_cluster() == (123.45, None)
+    # Still consumed, so it cannot leak into a later wait.
+    assert executor._fresh_submission is None
+
+
+def _record_fresh_submission_at_wait(executor):
+    """Replace the submit wait with one that records _fresh_submission."""
+    seen = []
+
+    def fake_wait():
+        seen.append(executor._fresh_submission)
+        return (123.45, None)
+
+    executor._wait_until_job_starts_on_cluster = mock.AsyncMock(
+        side_effect=fake_wait)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_launch_trusts_launch_result_on_first_attempt(monkeypatch):
+    executor = _make_launch_executor()
+    _patch_launch_environment(monkeypatch)
+    seen = _record_fresh_submission_at_wait(executor)
+    executor._await_launch_request = mock.AsyncMock(return_value=(7, object()))
+
+    assert await executor._launch(max_retry=1, raise_on_failure=True) == 123.45
+    assert len(seen) == 1
+    submission = seen[0]
+    assert submission is not None
+    assert submission.job_id == 7
+    assert submission.completed_at > 0
+
+
+@pytest.mark.asyncio
+async def test_launch_does_not_trust_launch_result_on_retry(monkeypatch):
+    """A retry follows a failure on this cluster, so keep the full check."""
+    executor = _make_launch_executor()
+    _patch_launch_environment(monkeypatch)
+    seen = _record_fresh_submission_at_wait(executor)
+    executor._await_launch_request = mock.AsyncMock(
+        side_effect=[ValueError('boom'), (7, object())])
+
+    assert await executor._launch(max_retry=2, raise_on_failure=True) == 123.45
+    assert seen == [None]
+
+
+@pytest.mark.asyncio
+async def test_launch_does_not_trust_launch_result_on_recovery(monkeypatch):
+    """A recovery follows a preemption or failure, so keep the full check."""
+    executor = _make_launch_executor()
+    _patch_launch_environment(monkeypatch)
+    seen = _record_fresh_submission_at_wait(executor)
+    executor._await_launch_request = mock.AsyncMock(return_value=(7, object()))
+
+    assert await executor._launch(max_retry=1,
+                                  raise_on_failure=True,
+                                  recovery=True) == 123.45
+    assert seen == [None]
+
+
+@pytest.mark.asyncio
+async def test_launch_trusts_pool_exec_result_on_first_attempt(monkeypatch):
+    """Pools: sdk.exec returns the on-cluster job id the same way."""
+    executor = _make_launch_executor()
+    executor.pool = 'my-pool'
+    executor.job_id_on_pool_cluster = None
+    _patch_launch_environment(monkeypatch)
+    monkeypatch.setattr(recovery_strategy.serve_utils, 'get_next_cluster_name',
+                        lambda *a, **k: 'pool-cluster-1')
+    monkeypatch.setattr(recovery_strategy.sdk, 'exec',
+                        mock.MagicMock(return_value='req-exec'))
+    monkeypatch.setattr(recovery_strategy.sdk, 'get',
+                        mock.MagicMock(return_value=(9, None)))
+    set_pool_job_id = mock.AsyncMock()
+    monkeypatch.setattr(recovery_strategy.state,
+                        'set_job_id_on_pool_cluster_async',
+                        set_pool_job_id,
+                        raising=False)
+    seen = _record_fresh_submission_at_wait(executor)
+
+    assert await executor._launch(max_retry=1, raise_on_failure=True) == 123.45
+    assert len(seen) == 1
+    submission = seen[0]
+    assert submission is not None
+    assert submission.job_id == 9

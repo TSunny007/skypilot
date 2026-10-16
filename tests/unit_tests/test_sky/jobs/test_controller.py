@@ -49,6 +49,25 @@ from sky.utils import status_lib
 from sky.utils.plugin_extensions import LogDeliverySource
 
 
+@pytest.fixture(autouse=True)
+def _monitor_reads_status_via_get_job_status(monkeypatch):
+    """Route the monitor's status read through get_job_status.
+
+    The monitor reads the job status with get_job_status_and_end_time (which
+    folds in a terminal job's end time), while the tests here stub
+    get_job_status. Delegating to it, looked up at call time so that each
+    test's stub applies, keeps them driving the monitor. The folded end time
+    itself is covered by TestUserJobStatusClassification.
+    """
+
+    async def via_get_job_status(*args, **kwargs):
+        status, reason = await managed_job_utils.get_job_status(*args, **kwargs)
+        return status, None, reason
+
+    monkeypatch.setattr(managed_job_utils, 'get_job_status_and_end_time',
+                        via_get_job_status)
+
+
 class TestNormalJobRecovery:
     """Tests for normal (single task) job recovery during controller restart.
 
@@ -1810,6 +1829,59 @@ class TestUserJobStatusClassification:
         executor.should_restart_on_failure.assert_called_once()
         mock_set_failed.assert_called_once()
         return mock_set_failed
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('worker_job_status', [
+        job_lib.JobStatus.SUCCEEDED,
+        job_lib.JobStatus.FAILED,
+    ])
+    @pytest.mark.parametrize('folded_end_time', [777.0, None])
+    async def test_terminal_status_uses_folded_end_time(self, worker_job_status,
+                                                        folded_end_time):
+        """The end time read with the status saves the separate query.
+
+        Only when the status read did not fold it in (gRPC, a runtime plugin
+        or a head running an older SkyPilot) is the end time queried again.
+        """
+        controller = self._make_controller()
+        executor = MagicMock()
+        executor.should_restart_on_failure.return_value = False
+        executor.max_restarts_on_errors = 0
+        mock_task = MagicMock()
+        mock_task.name = 'test-task'
+        mock_task.num_nodes = 1
+        status_read = AsyncMock(return_value=(worker_job_status,
+                                              folded_end_time, None))
+
+        with patch('asyncio.sleep', new=AsyncMock()), \
+             patch('sky.backends.backend_utils.async_check_network_connection',
+                   new=AsyncMock()), \
+             patch.object(managed_job_utils, 'get_job_status_and_end_time',
+                          new=status_read), \
+             patch('sky.jobs.utils.try_to_get_job_end_time',
+                   return_value=12345.0) as end_time_query, \
+             patch('sky.backends.backend_utils.refresh_cluster_status_handle',
+                   return_value=(status_lib.ClusterStatus.UP, MagicMock())), \
+             patch('sky.backends.backend_utils.get_clusters',
+                   return_value=[]), \
+             patch('sky.jobs.state.set_succeeded_async',
+                   new=AsyncMock()) as set_succeeded, \
+             patch('sky.jobs.state.set_failed_async',
+                   new=AsyncMock()) as set_failed:
+            await controller._monitor_one_task(
+                task_id=0,
+                task=mock_task,
+                cluster_name='test-cluster',
+                executor=executor,
+                callback_func=MagicMock(),
+            )
+
+        expected = 12345.0 if folded_end_time is None else folded_end_time
+        set_state = (set_succeeded if worker_job_status
+                     == job_lib.JobStatus.SUCCEEDED else set_failed)
+        set_state.assert_called_once()
+        assert set_state.call_args.kwargs['end_time'] == expected
+        assert end_time_query.called == (folded_end_time is None)
 
     @pytest.mark.asyncio
     async def test_failed_driver_maps_to_failed_not_controller(self):
