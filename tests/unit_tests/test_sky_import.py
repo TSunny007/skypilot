@@ -266,6 +266,47 @@ else:
         f'(budget {_LEAF_MODULE_BUDGET})')
 
 
+@pytest.mark.parametrize('module', [
+    'sky.catalog.data_fetchers.fetch_vsphere',
+    'sky.metrics',
+    'sky.metrics.utils',
+    'sky.server.auth',
+    'sky.server.auth.db_lookup',
+    'sky.server.config',
+    'sky.server.daemons',
+    'sky.users.rbac',
+    'sky.users.resolver',
+])
+def test_module_imports_first_in_a_fresh_interpreter(module, tmp_path):
+    """Each module imports cleanly as the first import of a process.
+
+    The eager `import sky` used to import most of SkyPilot in one fixed
+    order, which hid circular imports between modules that a process (the
+    API server, its daemons and workers) can import first.
+
+    A config file is present because loading `sky.skypilot_config` then
+    validates it, and building the config schema is part of the import
+    graph.
+    """
+    config = tmp_path / 'config.yaml'
+    config.write_text('daemons:\n'
+                      '  skypilot-status-refresh-daemon:\n'
+                      '    log_level: DEBUG\n')
+    env = dict(os.environ)
+    env['SKYPILOT_DEBUG'] = '0'
+    env['SKYPILOT_GLOBAL_CONFIG'] = str(config)
+    # The internal override (skypilot_config.ENV_VAR_SKYPILOT_CONFIG) would
+    # win over the file above.
+    env.pop('SKYPILOT_CONFIG', None)
+    result = subprocess.run([sys.executable, '-c', f'import {module}'],
+                            capture_output=True,
+                            text=True,
+                            env=env,
+                            check=False)
+    assert result.returncode == 0, (
+        f'import {module} failed in a fresh interpreter:\n{result.stderr}')
+
+
 def test_registries_populate_lazily():
     """Registries populate on first read, not at `import sky` time."""
     check_script = '''
