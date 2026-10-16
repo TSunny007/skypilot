@@ -551,7 +551,8 @@ def server_heartbeat_event():
     time.sleep(server_constants.SERVER_HEARTBEAT_INTERVAL_SECONDS)
 
 
-# Register the events to run in the background.
+# Register the events to run in the background. Keep the ids in sync with
+# server_constants.INTERNAL_REQUEST_DAEMON_IDS, which the config schema reads.
 INTERNAL_REQUEST_DAEMONS = [
     # This status refresh daemon can cause the autostopp'ed/autodown'ed cluster
     # set to updated status automatically, without showing users the hint of

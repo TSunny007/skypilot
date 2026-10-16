@@ -7,7 +7,10 @@ from unittest import mock
 import pytest
 
 from sky import skypilot_config
+from sky.server import constants as server_constants
 from sky.server import daemons
+from sky.utils import common_utils
+from sky.utils import schemas
 
 
 def _mock_get_nested(max_bytes):
@@ -290,3 +293,29 @@ class TestConsolidationEventInstancePersistence:
             assert mock_event.call_count == 2
             assert mock.call(pool=False) in mock_event.call_args_list
             assert mock.call(pool=True) in mock_event.call_args_list
+
+
+class TestDaemonIdsInTheConfigSchema:
+    """The config schema reads the daemon ids from server constants."""
+
+    def test_constants_list_every_daemon_in_order(self):
+        assert tuple(d.id for d in daemons.INTERNAL_REQUEST_DAEMONS) == (
+            server_constants.INTERNAL_REQUEST_DAEMON_IDS)
+
+    def test_each_daemon_is_configurable(self):
+        config = {
+            'daemons': {
+                d.id: {
+                    'log_level': 'DEBUG',
+                    'interval_seconds': 30,
+                } for d in daemons.INTERNAL_REQUEST_DAEMONS
+            }
+        }
+        common_utils.validate_schema(config, schemas.get_config_schema(),
+                                     'Invalid config: ')
+
+    def test_an_unknown_daemon_is_rejected(self):
+        config = {'daemons': {'no-such-daemon': {'log_level': 'DEBUG'}}}
+        with pytest.raises(ValueError, match='no-such-daemon'):
+            common_utils.validate_schema(config, schemas.get_config_schema(),
+                                         'Invalid config: ')

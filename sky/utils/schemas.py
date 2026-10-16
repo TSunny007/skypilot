@@ -7,6 +7,7 @@ import enum
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+from sky.server import constants as server_constants
 from sky.skylet import autostop_lib
 from sky.skylet import constants
 from sky.utils import kubernetes_enums
@@ -1911,9 +1912,6 @@ _SLURM_USERNAME_MAP_SCHEMA = {
 
 
 def get_config_schema():
-    # pylint: disable=import-outside-toplevel
-    from sky.server import daemons
-
     resources_schema = {
         k: v
         for k, v in get_resources_schema().items()
@@ -2599,8 +2597,8 @@ def get_config_schema():
         'properties': {}
     }
 
-    for daemon in daemons.INTERNAL_REQUEST_DAEMONS:
-        daemon_schema['properties'][daemon.id] = daemon_config
+    for daemon_id in server_constants.INTERNAL_REQUEST_DAEMON_IDS:
+        daemon_schema['properties'][daemon_id] = daemon_config
 
     api_server = {
         'type': 'object',

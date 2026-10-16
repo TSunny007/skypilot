@@ -138,6 +138,22 @@ DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), '..', 'dashboard',
 # The interval (seconds) for the event to be restarted in the background.
 DAEMON_RESTART_INTERVAL_SECONDS = 20
 
+# The ids of the internal request daemons in sky/server/daemons.py, in the
+# order of INTERNAL_REQUEST_DAEMONS there (a unit test keeps the two in sync).
+# The config schema (sky/utils/schemas.py) reads them here, not from
+# daemons.py: it is built while `sky.skypilot_config` validates the config on
+# import, and daemons.py imports `sky.skypilot_config` and
+# `sky.global_user_state`, so reading them from daemons.py was circular.
+INTERNAL_REQUEST_DAEMON_IDS = (
+    'skypilot-status-refresh-daemon',
+    'skypilot-volume-status-refresh-daemon',
+    'sky-serve-status-refresh-daemon',
+    'pool-status-refresh-daemon',
+    'server-heartbeat-daemon',
+    'expired-token-cleanup-daemon',
+    'launch-metrics-daemon',
+)
+
 # Timeout for CLI authentication sessions (polling-based auth flow).
 # Used by both client (polling timeout) and server (session expiration).
 AUTH_SESSION_TIMEOUT_SECONDS = 300  # 5 minutes
