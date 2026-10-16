@@ -833,6 +833,46 @@ def _post_provision_setup(
                                        stdout, cluster_info.num_instances))
             return ray_port, ray_cluster_healthy, head_ray_needs_restart
 
+        # Whether the head's Ray supports the live node query; cleared on the
+        # first unexpected failure (e.g. a Ray version without that API).
+        live_ray_node_query_supported = True
+
+        def check_ray_port_and_cluster_alive() -> Tuple[int, bool, bool]:
+            """check_ray_port_and_cluster_healthy() from GCS's live view.
+
+            For the readiness wait on fresh Kubernetes clusters: counts the
+            nodes alive in the head's GCS node table, instead of parsing
+            `ray status`, whose snapshot lags node registration by up to the
+            autoscaler monitor's 5 s update interval and whose CLI import
+            makes each check cost seconds on a fresh pod. Status refreshes
+            after provisioning still read `ray status`; they retry for a few
+            seconds when nodes are missing, which covers the lag.
+            """
+            nonlocal live_ray_node_query_supported
+            if live_ray_node_query_supported:
+                returncode, stdout, stderr = head_runner.run(
+                    instance_setup.RAY_ALIVE_NODES_WITH_SKY_RAY_PORT_COMMAND,
+                    stream_logs=False,
+                    require_outputs=True)
+                if returncode == instance_setup.RAY_GCS_NOT_UP_EXIT_CODE:
+                    # Head Ray not up (yet): same as `ray status` failing.
+                    return constants.SKY_REMOTE_RAY_PORT, False, True
+                alive_nodes = (instance_setup.parse_ray_alive_nodes(stdout)
+                               if returncode == 0 else None)
+                if alive_nodes is not None:
+                    ray_port = message_utils.decode_payload(stdout)['ray_port']
+                    logger.debug(f'Ray cluster on head is up with port '
+                                 f'{ray_port}; alive nodes: {alive_nodes}.')
+                    return (ray_port,
+                            len(alive_nodes) == cluster_info.num_instances,
+                            False)
+                logger.debug('Live Ray node query failed '
+                             f'(returncode={returncode}); falling back to '
+                             f'`ray status`.\nstdout: {stdout}\n'
+                             f'stderr: {stderr}')
+                live_ray_node_query_supported = False
+            return check_ray_port_and_cluster_healthy()
+
         status.update(
             runtime_preparation_str.format(step=3, step_name='runtime'))
 
@@ -862,7 +902,7 @@ def _post_provision_setup(
             while True:
                 # Wait until Ray cluster is ready
                 (ray_port, ray_cluster_healthy,
-                 head_ray_needs_restart) = check_ray_port_and_cluster_healthy()
+                 head_ray_needs_restart) = check_ray_port_and_cluster_alive()
                 if ray_cluster_healthy:
                     logger.debug('Ray cluster is ready. Skip head and worker '
                                  'node ray cluster setup.')
