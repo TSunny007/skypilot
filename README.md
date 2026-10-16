@@ -5,7 +5,12 @@ This fork holds a work trial on SkyPilot's multi-node managed-job launch latency
 **The result.** A 4-node managed job on a local Kind cluster used to take **54.15 s** from `sky jobs launch` until every rank's `run:` had started (mean of 4 warm trials). On [`ll/benchmarked-stack`](https://github.com/TSunny007/skypilot/tree/ll/benchmarked-stack) with the opt-in `kubernetes.fast_start: true`, it takes **26.65 s**: 26.40 and 26.90 s over 2 trials, −51%.
 - **The main change is structural.** A managed-job pod now carries its job and starts it itself. Before, the API server host waited for Ray and then pushed the job through a serial chain of `kubectl exec` calls.
 - **It ships alongside** cheaper Ray startup, a faster control plane and lazy imports. No run isolates each part's share.
-- **Where the remaining 27 s goes** is measured: the host's wheel install takes 7.7 s, a cold `import sky` on the head plus the Ray dispatch take most of the rest, and there's a hidden 6 s DNS wait. The next levers are listed with each one.
+- **Where the remaining 27 s goes** is measured ([`wheel_and_submit.md`](https://github.com/TSunny007/skypilot/blob/ll/consolidated/bench/design/wheel_and_submit.md)):
+  - The critical path is the head pod's own environment setup (PyPI `skypilot` 2.8 s, Ray patches ~2 s, the setuptools/click pin 0.7 s), then `ray start --head` (~9.5 s).
+  - The host's wheel install and the cold `import` (0.3 s) are off the critical path.
+- **Why that came last, and why it is cheap:**
+  - It depends on the workload's environment: image contents, custom images, PyPI access, image cache. One warm Kind node can't give numbers that generalize, so we fixed the structural costs that exist everywhere first.
+  - It is still low-hanging fruit, with known small fixes (deps-only install with `--no-deps`, a Ray patch step without importing Ray, pins/patches/bytecode baked into the default image). Estimated ~22 s after a day, ~15–18 s after a week.
 - **Scope of the evidence.** Everything was measured on one 8-core Kind node. The docs tag each claim as measured [V], read in code [C] or estimated [H].
 
 ## Where to look, in order
