@@ -19,6 +19,7 @@ from sky.provision import constants
 from sky.provision import docker_utils
 from sky.provision.kubernetes import config as config_lib
 from sky.provision.kubernetes import constants as k8s_constants
+from sky.provision.kubernetes import fast_start
 from sky.provision.kubernetes import host_network_ports
 from sky.provision.kubernetes import host_network_probe
 from sky.provision.kubernetes import utils as kubernetes_utils
@@ -3079,6 +3080,8 @@ def terminate_instances(
         # Only do this when terminating the entire cluster, not when
         # terminating workers only (head services should remain).
         _delete_cluster_services(cluster_name_on_cloud, namespace, context)
+        if provider_config.get('fast_start'):
+            fast_start.delete_objects(cluster_name_on_cloud, namespace, context)
 
 
 def cleanup_cluster_resources(
@@ -3099,6 +3102,8 @@ def cleanup_cluster_resources(
     namespace = kubernetes_utils.get_namespace_from_config(provider_config)
     context = kubernetes_utils.get_control_context_from_config(provider_config)
     _delete_cluster_services(cluster_name_on_cloud, namespace, context)
+    if provider_config.get('fast_start'):
+        fast_start.delete_objects(cluster_name_on_cloud, namespace, context)
 
 
 # The probe runs as soon as ray-installation finishes in step 2 of the
